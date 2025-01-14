@@ -180,7 +180,6 @@ __global__ void fully_fused_projection_packed_bwd_kernel(
     pos_world_to_cam_vjp(R, t, glm::make_vec3(means), v_mean_c, v_R, v_t, v_mean);
     covar_world_to_cam_vjp(R, covar, v_covar_c, v_R, v_covar);
 
-    __shared__ T shared_mem[1024];
 
     if (sparse_grad) {
         // Write sparse gradients

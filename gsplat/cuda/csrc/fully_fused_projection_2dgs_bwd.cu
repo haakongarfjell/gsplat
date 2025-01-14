@@ -105,7 +105,6 @@ __global__ void fully_fused_projection_bwd_2dgs_kernel(
         v_mean
     );
 
-    __shared__ T shared_mem[1024];
     // Write out results
     if (v_means != nullptr) {
         atomicAdd(v_means + gid * 3 + 0, v_mean.x);
