@@ -326,6 +326,90 @@ def _fully_fused_projection(
     radii = radius.int()
     return radii, means2d, depths, conics, compensations
 
+def _fully_fused_projection2(
+    means: Tensor,  # [N, 3]
+    covars: Tensor,  # [N, 3, 3]
+    viewmats: Tensor,  # [C, 4, 4]
+    Ks: Tensor,  # [C, 3, 3]
+    width: int,
+    height: int,
+    eps2d: float = 0.3,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    calc_compensations: bool = False,
+    camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole",
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor], Tensor]:
+    """PyTorch implementation of `gsplat.cuda._wrapper.fully_fused_projection()` with indices of kept Gaussians.
+
+    .. note::
+
+        This is a minimal implementation of fully fused version, which has more
+        arguments. Not all arguments are supported.
+    """
+    means_c, covars_c = _world_to_cam(means, covars, viewmats)
+
+    if camera_model == "ortho":
+        means2d, covars2d = _ortho_proj(means_c, covars_c, Ks, width, height)
+    elif camera_model == "fisheye":
+        means2d, covars2d = _fisheye_proj(means_c, covars_c, Ks, width, height)
+    elif camera_model == "pinhole":
+        means2d, covars2d = _persp_proj(means_c, covars_c, Ks, width, height)
+    else:
+        assert_never(camera_model)
+
+    det_orig = (
+        covars2d[..., 0, 0] * covars2d[..., 1, 1]
+        - covars2d[..., 0, 1] * covars2d[..., 1, 0]
+    )
+    covars2d = covars2d + torch.eye(2, device=means.device, dtype=means.dtype) * eps2d
+
+    det = (
+        covars2d[..., 0, 0] * covars2d[..., 1, 1]
+        - covars2d[..., 0, 1] * covars2d[..., 1, 0]
+    )
+    det = det.clamp(min=1e-10)
+
+    if calc_compensations:
+        compensations = torch.sqrt(torch.clamp(det_orig / det, min=0.0))
+    else:
+        compensations = None
+
+    conics = torch.stack(
+        [
+            covars2d[..., 1, 1] / det,
+            -(covars2d[..., 0, 1] + covars2d[..., 1, 0]) / 2.0 / det,
+            covars2d[..., 0, 0] / det,
+        ],
+        dim=-1,
+    )  # [C, N, 3]
+
+    depths = means_c[..., 2]  # [C, N]
+
+    b = (covars2d[..., 0, 0] + covars2d[..., 1, 1]) / 2  # (...,)
+    v1 = b + torch.sqrt(torch.clamp(b**2 - det, min=0.01))  # (...,)
+    radius = torch.ceil(3.0 * torch.sqrt(v1))  # (...,)
+
+    valid = (det > 0) & (depths > near_plane) & (depths < far_plane)
+    radius[~valid] = 0.0
+
+    inside = (
+        (means2d[..., 0] + radius > 0)
+        & (means2d[..., 0] - radius < width)
+        & (means2d[..., 1] + radius > 0)
+        & (means2d[..., 1] - radius < height)
+    )
+    radius[~inside] = 0.0
+
+    radii = radius.int()
+
+    # Calculate the mask of valid Gaussians
+    final_valid_mask = valid & inside  # [C, N]
+
+    # Extract indices of valid Gaussians
+    valid_indices = final_valid_mask.nonzero(as_tuple=False)[:, 1]  # Extract Gaussian indices
+
+    return valid_indices
+
 
 @torch.no_grad()
 def _isect_tiles(
@@ -712,3 +796,212 @@ def _spherical_harmonics(
     bases = torch.zeros_like(coeffs[..., 0])
     bases[..., :num_bases] = _eval_sh_bases_fast(num_bases, dirs)
     return (bases[..., None] * coeffs).sum(dim=-2)
+
+def generate_rays(
+    c2w: Tensor, 
+    K: Tensor, 
+    width: int, 
+    height: int,
+) -> Tuple[Tensor, Tensor]:
+
+    i, j = torch.meshgrid(torch.arange(width, device=K.device),
+                          torch.arange(height, device=K.device),
+                          indexing="ij")
+    i = i.t().float()
+    j = j.t().float()
+
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    directions = torch.stack([(i - cx) / fx, (j - cy) / fy, torch.ones_like(i)], dim=-1)  # [H, W, 3]
+    directions = directions @ c2w[:3, :3].T  
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)  
+
+    origins = c2w[:3, 3].expand_as(directions)
+
+    return origins, directions
+
+def gaussian_to_ellipse(
+    means: Tensor,
+    quats: Tensor,
+    scales: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+
+    covs, _ = _quat_scale_to_covar_preci(quats, scales) 
+    U, S, Vh = torch.linalg.svd(covs)
+
+    S_reduced = S[:, :2]  # Select the two largest eigenvalues [N, 2]
+    U_reduced = U[:, :, :2] 
+
+    r_a = torch.sqrt(S_reduced[:, 0])  
+    r_b = torch.sqrt(S_reduced[:, 1])
+
+    axes_a = U_reduced[:, :, 0] / torch.norm(U_reduced[:, :, 0], dim=-1, keepdim=True)  
+    axes_b = U_reduced[:, :, 1] / torch.norm(U_reduced[:, :, 1], dim=-1, keepdim=True) 
+    
+    return r_a, r_b, axes_a, axes_b
+
+def cull_mask(
+    ro: Tensor, # [3]
+    rd: Tensor, # [3]
+    r_a: Tensor,
+    r_b: Tensor, 
+    means: Tensor, # [N,3]
+) -> Tensor:
+
+    v = means - ro
+    
+    in_front = torch.sum(v * rd, dim=-1) > 0
+
+    dist = torch.norm(torch.cross(v, rd.expand_as(v), dim=-1), dim=-1)  # [N, 3]
+
+    # return (dist <= r_a) | (dist <= r_b)
+    return in_front & ((dist <= r_a) | (dist <= r_b))
+
+def signed_distance(
+    pos: Tensor,
+    means: Tensor,
+    r_a: Tensor,
+    r_b: Tensor,
+    axes_a: Tensor,
+    axes_b: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    
+    diff = pos - means
+
+    proj_a = torch.sum(diff * axes_a, dim=-1)
+    proj_b = torch.sum(diff * axes_b, dim=-1)
+    
+    proj_point = (
+        proj_a.unsqueeze(-1) * axes_a +
+        proj_b.unsqueeze(-1) * axes_b 
+    )
+    
+    scaled_a = proj_a / r_a
+    scaled_b = proj_b / r_b
+    
+    scale_factor = torch.sqrt(scaled_a**2 + scaled_b**2)
+    
+    closest_a = proj_a / scale_factor
+    closest_b = proj_b / scale_factor
+    closest_point_boundary = (
+        closest_a.unsqueeze(-1) * axes_a +
+        closest_b.unsqueeze(-1) * axes_b
+    )
+    
+    dist_proj = torch.norm(diff - proj_point, dim=-1)
+    dist_boundary = torch.norm(diff - closest_point_boundary, dim=-1)
+
+    inside_mask = (scaled_a**2 + scaled_b**2) <= 1
+
+    dist = torch.where(inside_mask, dist_proj, dist_boundary)
+
+    dist_min, dist_indices = torch.min(dist, dim=0)
+
+    return dist_min, dist_indices
+
+
+def sphere_trace(
+    means: Tensor,
+    quats: Tensor,
+    scales: Tensor,
+    colors: torch.Tensor,
+    origins: Tensor,
+    directions: Tensor,
+    max_steps: int = 256,
+    min_hit_distance: float = 0.001,
+    max_trace_distance: float = 10.0,
+) -> torch.Tensor:
+
+    H, W = origins.shape[:2]
+    N = means.shape[0]
+
+    total_distance = torch.zeros((H, W), device=means.device)
+    hit_color = torch.zeros((H, W, 3), device=means.device)
+
+    r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales)
+
+    for i in range(H):
+        for j in range(W):
+
+            ro = origins[i,j]
+            rd = directions[i, j]
+            
+            mask = cull_mask(ro, rd, r_a, r_b, means)
+
+            r_a_reduced = r_a[mask]
+            r_b_reduced = r_b[mask]
+            axes_a_reduced = axes_a[mask]
+            axes_b_reduced = axes_b[mask]
+            means_reduced = means[mask]
+            colors_reduced = colors[mask]
+            print(f"pixel ({i, j}) / ({H, W}), number of gaussians {means_reduced.shape[0]}", end="\r")
+
+            if means_reduced.shape[0] == 0:
+                total_distance[i, j] = max_trace_distance
+                continue
+
+            t = 0.0
+            ray_hit_color = torch.zeros(3, device=means.device)
+            for steps in range(max_steps):
+                pos = ro + t*rd
+
+                dist, idx = signed_distance(pos, means_reduced, r_a_reduced, r_b_reduced, axes_a_reduced, axes_b_reduced)
+                
+                if dist < min_hit_distance:
+                    ray_hit_color = colors_reduced[idx, 0]
+                    total_distance[i, j] = t
+                    break
+                
+                t += dist
+
+                if dist > max_trace_distance:
+                    total_distance[i, j] = max_trace_distance
+                    break
+                
+            # total_distance[i, j] = t
+            hit_color[i, j] = ray_hit_color
+
+    return hit_color, total_distance
+
+def calculate_depth(
+    K: Tensor,
+    distance: Tensor,
+    width: int, 
+    height: int,
+) -> Tensor:
+
+    K_inv = torch.linalg.inv(K)
+
+    i, j = torch.meshgrid(
+        torch.arange(width, device=K.device),
+        torch.arange(height, device=K.device),
+        indexing="ij"
+    )
+
+    pixels_homog = torch.stack([i, j, torch.ones_like(i)], dim=-1).float()
+    pixels_normalized = (K_inv @ pixels_homog.reshape(-1, 3).T).T.reshape(height, width, 3)  # [H, W, 3]
+
+    denom = torch.sqrt(pixels_normalized[..., 0]**2 + pixels_normalized[..., 1]**2 + 1)
+    depth = distance / denom
+
+    return depth
+
+def generate_depth_image(
+    depth: Tensor,
+    distance: Tensor,
+    distance_threshold: float,
+) -> Tensor:
+
+    threshold_mask = distance < distance_threshold 
+
+    min_depth = 0.0
+    max_depth = depth[threshold_mask].max() if threshold_mask.any() else 1.0
+    depth_norm = torch.zeros_like(depth)
+
+    depth_norm[threshold_mask] = (depth[threshold_mask] - min_depth) / (max_depth - min_depth)
+
+    return depth_norm.unsqueeze(-1).expand(-1, -1, 3) 
+
+
+    
