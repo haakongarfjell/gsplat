@@ -219,19 +219,19 @@ __global__ void fully_fused_projection_packed_bwd_kernel(
         }
     } else {
         if (v_means != nullptr) {
-            atomicAdd(v_means + gid * 3 + 0, v_mean.x);
-            atomicAdd(v_means + gid * 3 + 1, v_mean.y);
-            atomicAdd(v_means + gid * 3 + 2, v_mean.z);
+            gpuAtomicAdd(v_means + gid * 3 + 0, v_mean.x);
+            gpuAtomicAdd(v_means + gid * 3 + 1, v_mean.y);
+            gpuAtomicAdd(v_means + gid * 3 + 2, v_mean.z);
         }
 
         if (v_covars != nullptr) {
             v_covars += gid * 6;
-            atomicAdd(v_covars, v_covar[0][0]);
-            atomicAdd(v_covars + 1, v_covar[0][1] + v_covar[1][0]);
-            atomicAdd(v_covars + 2, v_covar[0][2] + v_covar[2][0]);
-            atomicAdd(v_covars + 3, v_covar[1][1]);
-            atomicAdd(v_covars + 4, v_covar[1][2] + v_covar[2][1]);
-            atomicAdd(v_covars + 5, v_covar[2][2]);
+            gpuAtomicAdd(v_covars, v_covar[0][0]);
+            gpuAtomicAdd(v_covars + 1, v_covar[0][1] + v_covar[1][0]);
+            gpuAtomicAdd(v_covars + 2, v_covar[0][2] + v_covar[2][0]);
+            gpuAtomicAdd(v_covars + 3, v_covar[1][1]);
+            gpuAtomicAdd(v_covars + 4, v_covar[1][2] + v_covar[2][1]);
+            gpuAtomicAdd(v_covars + 5, v_covar[2][2]);
         } else {
             mat3<T> rotmat = quat_to_rotmat<T>(quat);
             vec4<T> v_quat(0.f);
@@ -241,23 +241,25 @@ __global__ void fully_fused_projection_packed_bwd_kernel(
             );
             v_quats += gid * 4;
             v_scales += gid * 3;
-            atomicAdd(v_quats, v_quat[0]);
-            atomicAdd(v_quats + 1, v_quat[1]);
-            atomicAdd(v_quats + 2, v_quat[2]);
-            atomicAdd(v_quats + 3, v_quat[3]);
-            atomicAdd(v_scales, v_scale[0]);
-            atomicAdd(v_scales + 1, v_scale[1]);
-            atomicAdd(v_scales + 2, v_scale[2]);
+            gpuAtomicAdd(v_quats, v_quat[0]);
+            gpuAtomicAdd(v_quats + 1, v_quat[1]);
+            gpuAtomicAdd(v_quats + 2, v_quat[2]);
+            gpuAtomicAdd(v_quats + 3, v_quat[3]);
+            gpuAtomicAdd(v_scales, v_scale[0]);
+            gpuAtomicAdd(v_scales + 1, v_scale[1]);
+            gpuAtomicAdd(v_scales + 2, v_scale[2]);
         }
     }
     // v_viewmats is always in dense layout
     if (v_viewmats != nullptr) {
         v_viewmats += cid * 16;
+        GSPLAT_PRAGMA_UNROLL
         for (uint32_t i = 0; i < 3; i++) { // rows
+            GSPLAT_PRAGMA_UNROLL
             for (uint32_t j = 0; j < 3; j++) { // cols
-                atomicAdd(v_viewmats + i * 4 + j, v_R[j][i]);
+                gpuAtomicAdd(v_viewmats + i * 4 + j, v_R[j][i]);
             }
-            atomicAdd(v_viewmats + i * 4 + 3, v_t[i]);
+            gpuAtomicAdd(v_viewmats + i * 4 + 3, v_t[i]);
         }
     }
 }

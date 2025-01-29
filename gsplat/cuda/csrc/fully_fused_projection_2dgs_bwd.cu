@@ -107,29 +107,31 @@ __global__ void fully_fused_projection_bwd_2dgs_kernel(
 
     // Write out results
     if (v_means != nullptr) {
-        atomicAdd(v_means + gid * 3 + 0, v_mean.x);
-        atomicAdd(v_means + gid * 3 + 1, v_mean.y);
-        atomicAdd(v_means + gid * 3 + 2, v_mean.z);
+        gpuAtomicAdd(v_means + gid * 3 + 0, v_mean.x);
+        gpuAtomicAdd(v_means + gid * 3 + 1, v_mean.y);
+        gpuAtomicAdd(v_means + gid * 3 + 2, v_mean.z);
     }
 
     if (v_quats != nullptr) {
-        atomicAdd(v_quats + gid * 4 + 0, v_quat[0]);
-        atomicAdd(v_quats + gid * 4 + 1, v_quat[1]);
-        atomicAdd(v_quats + gid * 4 + 2, v_quat[2]);
-        atomicAdd(v_quats + gid * 4 + 3, v_quat[3]);
+        gpuAtomicAdd(v_quats + gid * 4 + 0, v_quat[0]);
+        gpuAtomicAdd(v_quats + gid * 4 + 1, v_quat[1]);
+        gpuAtomicAdd(v_quats + gid * 4 + 2, v_quat[2]);
+        gpuAtomicAdd(v_quats + gid * 4 + 3, v_quat[3]);
     }
 
     if (v_scales != nullptr) {
-        atomicAdd(v_scales + gid * 3 + 0, v_scale[0]);
-        atomicAdd(v_scales + gid * 3 + 1, v_scale[1]);
+        gpuAtomicAdd(v_scales + gid * 3 + 0, v_scale[0]);
+        gpuAtomicAdd(v_scales + gid * 3 + 1, v_scale[1]);
     }
 
     if (v_viewmats != nullptr) {
+        GSPLAT_PRAGMA_UNROLL
         for (uint32_t i = 0; i < 3; ++i) {
+            GSPLAT_PRAGMA_UNROLL
             for (uint32_t j = 0; j < 3; ++j) {
-                atomicAdd(v_viewmats + cid * 16 + i * 4 + j, R[j][i]);
+                gpuAtomicAdd(v_viewmats + cid * 16 + i * 4 + j, R[j][i]);
             }
-            atomicAdd(v_viewmats + cid * 16 + i * 4 + 3, t[i]);
+            gpuAtomicAdd(v_viewmats + cid * 16 + i * 4 + 3, t[i]);
         }
     }
 }
