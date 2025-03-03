@@ -33,6 +33,36 @@ def selective_adam_update(
         param, param_grad, exp_avg, exp_avg_sq, tiles_touched, lr, b1, b2, eps, N, M
     )
 
+def sphere_trace(
+    means: Tensor, 
+    quats: Tensor, 
+    scales: Tensor, 
+    colors: Tensor, 
+    origins: Tensor, 
+    directions: Tensor,
+    r_a: Tensor,
+    r_b: Tensor,
+    axes_a: Tensor,
+    axes_b: Tensor,
+    max_steps: int = 256, 
+    min_hit_distance: float = 0.001, 
+    max_trace_distance: float = 10.0
+) -> Tuple[Tensor, Tensor]:
+
+    return _make_lazy_cuda_func("sphere_trace")(
+        means, 
+        quats, 
+        scales, 
+        colors, 
+        origins, 
+        directions, 
+        r_a, r_b, 
+        axes_a, 
+        axes_b,
+        max_steps, 
+        min_hit_distance, 
+        max_trace_distance
+    )
 
 def _make_lazy_cuda_obj(name: str) -> Any:
     # pylint: disable=import-outside-toplevel

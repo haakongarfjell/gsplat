@@ -91,6 +91,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> world_to_cam_bwd_tensor(
     const bool viewmats_requires_grad
 );
 
+std::tuple<torch::Tensor, torch::Tensor> sphere_trace_tensor(
+    const torch::Tensor &means, 
+    const torch::Tensor &quats,
+    const torch::Tensor &scales,
+    const torch::Tensor &colors, 
+    const torch::Tensor &origins, 
+    const torch::Tensor &directions,
+    const torch::Tensor &r_a,
+    const torch::Tensor &r_b,
+    const torch::Tensor &axes_a,
+    const torch::Tensor &axes_b,
+    const int max_steps, 
+    const float min_hit_distance, 
+    const float max_trace_distance
+);
+
 std::tuple<
     torch::Tensor,
     torch::Tensor,

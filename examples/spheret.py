@@ -22,9 +22,13 @@ from gsplat.cuda._torch_impl import (
     gaussian_to_ellipse,
     cull_mask,
     signed_distance,
-    sphere_trace,
+    # sphere_trace,
     calculate_depth,
     generate_depth_image
+)
+
+from gsplat.cuda._wrapper import(
+    sphere_trace
 )
 
 
@@ -79,19 +83,25 @@ def main(local_rank: int, world_rank, world_size: int, args):
             
         elif args.backend == "sphere_trace":            
             origins, directions = generate_rays(c2w, K, width, height)
+            r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales)
 
             hit_color, total_distance = sphere_trace(
                 means,
                 quats,
                 scales,
                 colors,
-                origins,
-                directions
+                origins.contiguous(),
+                directions.contiguous(),
+                r_a,
+                r_b,
+                axes_a,
+                axes_b
             )
 
-            torch.save(total_distance, "results/distance.pt")
-            torch.save(hit_color, "result/colors.pt")
+            # torch.save(total_distance, "results/distance.pt")
+            # # torch.save(hit_color, "result/colors.pt")
 
+            # print("saved")
             depth = calculate_depth(K, total_distance, width, height)
             depth_img = generate_depth_image(depth, total_distance, (9.5))
 
@@ -159,7 +169,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
             f"{args.output_dir}/render_rasterization.png",
             (rendered_image * 255).astype(np.uint8),
         )
-    elif args.backend == "raymarch":
+    elif args.backend == "sphere_trace":
         imageio.imsave(
             f"{args.output_dir}/render_sphere_trace.png",
             (rendered_image * 255).astype(np.uint8),
@@ -170,14 +180,14 @@ def main(local_rank: int, world_rank, world_size: int, args):
             (rendered_image * 255).astype(np.uint8),
         )
 
-    # server = viser.ViserServer(port=8080, verbose=False)
-    # _ = nerfview.Viewer(
-    #     server=server,
-    #     render_fn=viewer_render_fn,
-    #     mode="rendering",
-    # )
-    # print("Viewer running... Ctrl+C to exit.")
-    # time.sleep(100000)
+    server = viser.ViserServer(port=8080, verbose=False)
+    _ = nerfview.Viewer(
+        server=server,
+        render_fn=viewer_render_fn,
+        mode="rendering",
+    )
+    print("Viewer running... Ctrl+C to exit.")
+    time.sleep(100000)
 
 if __name__ == "__main__":
     """
