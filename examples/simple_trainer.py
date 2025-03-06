@@ -15,7 +15,8 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.colmap import Dataset, Parser
+# from datasets.colmap import Dataset, Parser
+from datasets.blender_parser import Dataset, Parser
 from datasets.traj import (
     generate_interpolated_path,
     generate_ellipse_path_z,
@@ -42,7 +43,21 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 from gsplat.utils import save_ply
-
+from gsplat.cuda._torch_impl import (
+    generate_rays,
+    gaussian_to_ellipse,
+    gaussian_to_ellipse_old,
+    calculate_depth,
+    generate_depth_image,
+    outer_ellipsoid,
+    _quat_scale_to_covar_preci,
+    signed_distance,
+    signed_distance_knn
+)
+from gsplat.cuda._wrapper import(
+    sphere_trace
+)
+from pytorch3d.transforms import matrix_to_quaternion
 
 @dataclass
 class Config:
@@ -68,7 +83,7 @@ class Config:
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
-    normalize_world_space: bool = True
+    normalize_world_space: bool = False # True
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -115,6 +130,7 @@ class Config:
 
     # Strategy for GS densification
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+        # default_factory=DefaultStrategy
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -159,6 +175,10 @@ class Config:
 
     # Enable depth loss. (experimental)
     depth_loss: bool = False
+
+    sdf_loss: bool = False
+
+    sdf_lambda: float = 1e-2
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
@@ -188,7 +208,6 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
-
 
 def create_splats_with_optimizers(
     parser: Parser,
@@ -220,6 +239,16 @@ def create_splats_with_optimizers(
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+
+    # covars, points, rgbs = outer_ellipsoid(points, rgbs, k=20, max_dist=0.005)
+    # covars = covars.to(dtype=torch.float32)
+    # points = points.to(dtype=torch.float32)
+
+    # U, S, Vh = torch.linalg.svd(covars)
+    # quats = matrix_to_quaternion(U)
+    # quats = F.normalize(quats, p=2, dim=-1)
+    # scales = 1. / torch.sqrt(S)
+    # scales = torch.log(scales)
 
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
@@ -318,6 +347,7 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            sdf_loss=cfg.sdf_loss,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -586,6 +616,17 @@ class Runner:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
+            if cfg.sdf_loss:
+                points_world = data["points_world"].to(device)  # [1, M, 3]
+                points_world = points_world.squeeze(0)
+
+                points_sample = points_world# [torch.randperm(points_world.shape[0])[:100]]
+                means = self.splats["means"]  # [N, 3]
+                quats = self.splats["quats"]
+                scales = torch.exp(self.splats["scales"])
+                r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales)
+                
+
             height, width = pixels.shape[1:3]
 
             if cfg.pose_noise:
@@ -637,10 +678,10 @@ class Runner:
             )
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
+            l1loss = F.l1_loss(colors, pixels) 
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
+            ) 
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # query depths from depth map
@@ -661,6 +702,11 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+
+            if cfg.sdf_loss:
+                sdf, idx = signed_distance_knn(points_sample, means, r_a, r_b, axes_a, axes_b)
+                sdfloss = F.l1_loss(sdf, torch.zeros_like(sdf))
+                loss += sdfloss * 10 #cfg.sdf_lambda
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
@@ -683,6 +729,8 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if cfg.sdf_loss:
+                desc += f"sdf loss={sdfloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -707,6 +755,8 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if cfg.sdf_loss:
+                    self.writer.add_scalar("train/sdfloss", sdfloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -999,6 +1049,40 @@ class Runner:
             canvas = (canvas * 255).astype(np.uint8)
             writer.append_data(canvas)
         writer.close()
+        writer = imageio.get_writer(f"{video_dir}/traj_sphere_trace_{step}.mp4", fps=30)
+        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
+            camtoworlds = camtoworlds_all[i : i + 1]
+            Ks = K[None]
+            c2w = camtoworlds.squeeze(0)
+            # Ks = torch.from_numpy(Ks).float().to(device)
+
+            means = self.splats["means"]  # [N, 3]
+            # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
+            # rasterization does normalization internally
+            quats = self.splats["quats"]  # [N, 4]
+            scales = torch.exp(self.splats["scales"])  # [N, 3]
+
+            origins, directions = generate_rays(c2w, K, width, height)
+            r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales)
+
+            hit_color, total_distance = sphere_trace(
+                means,
+                quats,
+                scales,
+                colors,
+                origins.contiguous(),
+                directions.contiguous(),
+                r_a,
+                r_b,
+                axes_a,
+                axes_b
+            )
+            depth = calculate_depth(K, total_distance, width, height)
+            depth_img = generate_depth_image(depth, total_distance, 15.0)
+            rendered_image = depth_img.cpu().numpy()
+            render = (rendered_image * 255).astype(np.uint8)
+            writer.append_data(render)
+
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
@@ -1033,7 +1117,7 @@ class Runner:
             camtoworlds=c2w[None],
             Ks=K[None],
             width=W,
-            height=H,
+            height=H,   
             sh_degree=self.cfg.sh_degree,  # active all SH degrees
             radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
         )  # [1, H, W, 3]

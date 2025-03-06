@@ -821,7 +821,44 @@ def generate_rays(
 
     return origins, directions
 
+from scipy.stats import chi2
+import math
 def gaussian_to_ellipse(
+    means: Tensor,
+    quats: Tensor,
+    scales: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+
+    # covs, _ = _quat_scale_to_covar_preci(quats, scales) 
+    # U, S, Vh = torch.linalg.svd(covs)
+
+    # S_reduced = S[:, :2]  # Select the two largest eigenvalues [N, 2]
+    # U_reduced = U[:, :, :2] 
+
+    # r_a = torch.sqrt(S_reduced[:, 0])  
+    # r_b = torch.sqrt(S_reduced[:, 1])
+
+    # axes_a = U_reduced[:, :, 0] / torch.norm(U_reduced[:, :, 0], dim=-1, keepdim=True)  
+    # axes_b = U_reduced[:, :, 1] / torch.norm(U_reduced[:, :, 1], dim=-1, keepdim=True) 
+    
+    # return r_a, r_b, axes_a, axes_b
+
+    U = _quat_to_rotmat(quats) # shape: (N, 3, 3)
+    S = scales**2               # shape: (N, 3)
+
+    sorted_S, indices = torch.sort(S, dim=1, descending=True)
+    U_sorted = torch.gather(U, dim=2, index=indices.unsqueeze(1).expand(-1, 3, -1))
+
+    #scale_factor = math.sqrt(chi2.ppf(0.99, df=3))
+    r_a = torch.sqrt(sorted_S[:, 0]) #* scale_factor
+    r_b = torch.sqrt(sorted_S[:, 1]) #* scale_factor 
+
+    axes_a = U_sorted[:, :, 0] / torch.norm(U_sorted[:, :, 0], dim=-1, keepdim=True)  
+    axes_b = U_sorted[:, :, 1] / torch.norm(U_sorted[:, :, 1], dim=-1, keepdim=True) 
+
+    return r_a, r_b, axes_a, axes_b
+
+def gaussian_to_ellipse_old(
     means: Tensor,
     quats: Tensor,
     scales: Tensor,
@@ -833,7 +870,8 @@ def gaussian_to_ellipse(
     S_reduced = S[:, :2]  # Select the two largest eigenvalues [N, 2]
     U_reduced = U[:, :, :2] 
 
-    r_a = torch.sqrt(S_reduced[:, 0])  
+
+    r_a = torch.sqrt(S_reduced[:, 0])
     r_b = torch.sqrt(S_reduced[:, 1])
 
     axes_a = U_reduced[:, :, 0] / torch.norm(U_reduced[:, :, 0], dim=-1, keepdim=True)  
@@ -858,45 +896,105 @@ def cull_mask(
     # return (dist <= r_a) | (dist <= r_b)
     return in_front & ((dist <= r_a) | (dist <= r_b))
 
-def signed_distance(
-    pos: Tensor,
-    means: Tensor,
-    r_a: Tensor,
-    r_b: Tensor,
-    axes_a: Tensor,
-    axes_b: Tensor,
-) -> Tuple[Tensor, Tensor]:
-    
-    diff = pos - means
+import numpy as np
+from scipy.spatial import cKDTree
 
-    proj_a = torch.sum(diff * axes_a, dim=-1)
-    proj_b = torch.sum(diff * axes_b, dim=-1)
+def knn_candidates(
+    means, 
+    points, 
+    k=10
+):
+    means_np = means.detach().cpu().numpy()
+    points_np = points.detach().cpu().numpy()
+
+    tree = cKDTree(means_np)
+    _, indices = tree.query(points_np, k=k)
+
+    return torch.tensor(indices, device=means.device)
+
+def signed_distance_knn(
+    pos: torch.Tensor,    # [M, 3]
+    means: torch.Tensor,  # [N, 3]
+    r_a: torch.Tensor,    # [N]
+    r_b: torch.Tensor,    # [N]
+    axes_a: torch.Tensor, # [N, 3]
+    axes_b: torch.Tensor, # [N, 3]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    indices = knn_candidates(means, pos, k=10)
+    means = means[indices]
+    r_a = r_a[indices]
+    r_b = r_b[indices]
+    axes_a = axes_a[indices]
+    axes_b = axes_b[indices]
+
+    diff = pos.unsqueeze(1) - means  # [M, k, 3]
+
+    proj_a = torch.sum(diff * axes_a, dim=-1)  # [M, k]
+    proj_b = torch.sum(diff * axes_b, dim=-1)  # [M, k]
+
+    proj_point = proj_a.unsqueeze(-1) * axes_a + proj_b.unsqueeze(-1) * axes_b  # [M, k, 3]
+
+    scaled_a = proj_a / r_a  # [M, k]
+    scaled_b = proj_b / r_b  # [M, k]
+    scale_factor = torch.sqrt(scaled_a**2 + scaled_b**2 + 1e-8)  # [M, k]
+
+    closest_a = proj_a / scale_factor  # [M, k]
+    closest_b = proj_b / scale_factor  # [M, k]
+    closest_point_boundary = (closest_a.unsqueeze(-1) * axes_a +
+                              closest_b.unsqueeze(-1) * axes_b)  # [M, k, 3]
+
+    dist_proj = torch.norm(diff - proj_point, dim=-1)            # [M, k]
+    dist_boundary = torch.norm(diff - closest_point_boundary, dim=-1)  # [M, k]
+
+    inside_mask = (scaled_a**2 + scaled_b**2) <= 1  # [M, k]
+
+    dist = torch.where(inside_mask, dist_proj, dist_boundary)  # [M, k]
+
+    dist_min, idx = torch.min(dist, dim=1)  # both: [M]
+
+    return dist_min, idx
+
+
+def signed_distance(
+    pos: torch.Tensor,    # [M, 3]
+    means: torch.Tensor,  # [N, 3]
+    r_a: torch.Tensor,    # [N]
+    r_b: torch.Tensor,    # [N]
+    axes_a: torch.Tensor, # [N, 3]
+    axes_b: torch.Tensor, # [N, 3]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    diff = pos[:, None, :] - means[None, :, :]
+
+    proj_a = torch.sum(diff * axes_a[None, :, :], dim=-1)  # [M,N]
+    proj_b = torch.sum(diff * axes_b[None, :, :], dim=-1)  # [M,N]
     
     proj_point = (
-        proj_a.unsqueeze(-1) * axes_a +
-        proj_b.unsqueeze(-1) * axes_b 
-    )
+        proj_a.unsqueeze(-1) * axes_a[None, :, :] +
+        proj_b.unsqueeze(-1) * axes_b[None, :, :]
+    )  # [M,N,3]
     
-    scaled_a = proj_a / r_a
-    scaled_b = proj_b / r_b
+    scaled_a = proj_a / (r_a[None, :])  # [M,N]
+    scaled_b = proj_b / (r_b[None, :])  # [M,N]
     
-    scale_factor = torch.sqrt(scaled_a**2 + scaled_b**2)
+    scale_factor = torch.sqrt(scaled_a**2 + scaled_b**2 + 1e-8)  # [M,N]
     
-    closest_a = proj_a / scale_factor
-    closest_b = proj_b / scale_factor
+    closest_a = proj_a / (scale_factor)  # [M,N]
+    closest_b = proj_b / (scale_factor) # [M,N]
     closest_point_boundary = (
-        closest_a.unsqueeze(-1) * axes_a +
-        closest_b.unsqueeze(-1) * axes_b
-    )
+        closest_a.unsqueeze(-1) * axes_a[None, :, :] +
+        closest_b.unsqueeze(-1) * axes_b[None, :, :]
+    )  # [M,N,3]
     
-    dist_proj = torch.norm(diff - proj_point, dim=-1)
-    dist_boundary = torch.norm(diff - closest_point_boundary, dim=-1)
+    dist_proj = torch.norm(diff - proj_point, dim=-1)  # [M,N]
+    dist_boundary = torch.norm(diff - closest_point_boundary, dim=-1)  # [M,N]
 
-    inside_mask = (scaled_a**2 + scaled_b**2) <= 1
+    inside_mask = (scaled_a**2 + scaled_b**2) <= 1  # [M,N]
 
-    dist = torch.where(inside_mask, dist_proj, dist_boundary)
-
-    dist_min, dist_indices = torch.min(dist, dim=0)
+    dist = torch.where(inside_mask, dist_proj, dist_boundary)  # [M,N]
+    
+    dist_min, dist_indices = torch.min(dist, dim=1)  # dist_min: [M], dist_indices: [M]
 
     return dist_min, dist_indices
 
@@ -920,6 +1018,7 @@ def sphere_trace(
     hit_color = torch.zeros((H, W, 3), device=means.device)
 
     r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales)
+
 
     for i in range(H):
         for j in range(W):
@@ -1004,4 +1103,66 @@ def generate_depth_image(
     return depth_norm.unsqueeze(-1).expand(-1, -1, 3) 
 
 
+from sklearn.neighbors import KDTree
+import numpy as np
+
+@torch.no_grad()
+def outer_ellipsoid(
+    points: Tensor,
+    rgbs: Tensor = None,
+    sample_size: int = None,
+    tol: float = 0.001,
+    max_iter: int = 5000,
+    k: int = 5,
+    max_dist: float = 0.01,
+    device = "cuda",
+) -> Tuple[Tensor, Tensor, Tensor]:
     
+    points_np = points.cpu().numpy()
+    tree = KDTree(points_np)
+    if sample_size is not None:
+        sample = np.random.choice(points_np.shape[0], size=sample_size, replace=False)
+        sampled_points = points_np[sample]
+        dist, idx = tree.query(sampled_points, k=k)
+    else:
+        dist, idx = tree.query(points_np, k=k)
+
+    valid_neighbors = np.all(dist <= max_dist, axis=1)
+    valid_idx = idx[valid_neighbors]
+
+    clusters = torch.tensor(points_np[valid_idx], dtype=torch.float64, device=device)
+    
+    B, N, d = clusters.shape
+    Q = torch.cat((clusters, torch.ones((B, N, 1), dtype=torch.float64, device=device)), dim=2).permute(0, 2, 1)
+    u = torch.ones((B, N), dtype=torch.float64, device=device) / N  # [B, N]
+    err = torch.ones(B, dtype=torch.float64, device=device) * (1 + tol)
+    active_mask = err > tol  
+
+    for i in range(max_iter):
+        if not torch.any(active_mask):
+            break
+
+        X = Q[active_mask] @ torch.diag_embed(u[active_mask]) @ Q[active_mask].transpose(1, 2)  # [B_active, 4, 4]
+        X_inv = torch.linalg.inv(X)  # [B_active, 4, 4]
+        M = torch.diagonal(Q[active_mask].transpose(1, 2) @ X_inv @ Q[active_mask], dim1=1, dim2=2)  # [B_active, N]
+        jdx = torch.argmax(M, dim=1)  # [B_active,]
+        step_size = (M[torch.arange(M.shape[0]), jdx] - d - 1.0) / ((d + 1) * (M[torch.arange(M.shape[0]), jdx] - 1.0))  # [B_active,]
+        new_u_active = (1 - step_size.unsqueeze(1)) * u[active_mask]  # [B_active, N]
+        new_u_active.scatter_add_(1, jdx.unsqueeze(1), step_size.unsqueeze(1)) 
+        err_active = torch.linalg.norm(new_u_active - u[active_mask], dim=1)  # [B_active,]
+            
+        u[active_mask] = new_u_active
+        err[active_mask] = err_active
+        active_mask = err > tol
+
+    c = torch.einsum('bn,bnd->bd', u, clusters)  # [B, 3]
+    intermediate = torch.einsum('bnd,bn,bnm->bdm', clusters, u, clusters)  # [B, 3, 3]
+    A = torch.linalg.inv(intermediate - torch.einsum('bd,bm->bdm', c, c)) / d  # [B, 3, 3]
+
+    if rgbs is not None:
+        print("\n Ellipsoids generated \n")
+        rgbs_np = rgbs.cpu().numpy()
+        rgbs_np = rgbs_np[valid_neighbors]
+        return A, c, torch.from_numpy(rgbs_np)
+    else:
+        return A, c, None
