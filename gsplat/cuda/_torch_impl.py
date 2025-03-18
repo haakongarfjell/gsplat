@@ -827,6 +827,7 @@ def gaussian_to_ellipse(
     means: Tensor,
     quats: Tensor,
     scales: Tensor,
+    opacities: Tensor,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
     # covs, _ = _quat_scale_to_covar_preci(quats, scales) 
@@ -849,9 +850,11 @@ def gaussian_to_ellipse(
     sorted_S, indices = torch.sort(S, dim=1, descending=True)
     U_sorted = torch.gather(U, dim=2, index=indices.unsqueeze(1).expand(-1, 3, -1))
 
-    #scale_factor = math.sqrt(chi2.ppf(0.99, df=3))
-    r_a = torch.sqrt(sorted_S[:, 0]) #* scale_factor
-    r_b = torch.sqrt(sorted_S[:, 1]) #* scale_factor 
+    # opacities_np = opacities.detach().cpu().numpy()
+    # scale_factor_np = np.sqrt(chi2.ppf(0.99, df=3)) * opacities_np
+    # scale_factor = torch.tensor(scale_factor_np, device=opacities.device)
+    r_a = torch.sqrt(sorted_S[:, 0])# * scale_factor
+    r_b = torch.sqrt(sorted_S[:, 1])# * scale_factor 
 
     axes_a = U_sorted[:, :, 0] / torch.norm(U_sorted[:, :, 0], dim=-1, keepdim=True)  
     axes_b = U_sorted[:, :, 1] / torch.norm(U_sorted[:, :, 1], dim=-1, keepdim=True) 
@@ -898,6 +901,19 @@ def cull_mask(
 
 import numpy as np
 from scipy.spatial import cKDTree
+import functorch
+from functools import partial
+
+def sdf_harmonics(
+    degree: int, 
+    dirs: torch.Tensor, 
+    coeffs: torch.Tensor
+):
+    dirs = F.normalize(dirs, p=2, dim=-1)
+    num_bases = (degree + 1) ** 2
+    bases = torch.zeros_like(coeffs)
+    bases[..., :num_bases] = _eval_sh_bases_fast(num_bases, dirs)
+    return (bases * coeffs).sum(dim=-1)
 
 def knn_candidates(
     means, 
@@ -918,43 +934,53 @@ def signed_distance_knn(
     r_a: torch.Tensor,    # [N]
     r_b: torch.Tensor,    # [N]
     axes_a: torch.Tensor, # [N, 3]
-    axes_b: torch.Tensor, # [N, 3]
+    axes_b: torch.Tensor, # [N, 3],
+    sdf_coeffs: torch.Tensor, # [M, K]
+    sh_degree: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     
-    indices = knn_candidates(means, pos, k=10)
-    means = means[indices]
-    r_a = r_a[indices]
-    r_b = r_b[indices]
-    axes_a = axes_a[indices]
-    axes_b = axes_b[indices]
+    indices = knn_candidates(means, pos, k=10)  # [M, k]
+    means_knn   = means[indices]      # [M, k, 3]
+    r_a_knn     = r_a[indices]        # [M, k]
+    r_b_knn     = r_b[indices]        # [M, k]
+    axes_a_knn  = axes_a[indices]     # [M, k, 3]
+    axes_b_knn  = axes_b[indices]     # [M, k, 3]
 
-    diff = pos.unsqueeze(1) - means  # [M, k, 3]
+    diff = pos.unsqueeze(1) - means_knn  # [M, k, 3]
 
-    proj_a = torch.sum(diff * axes_a, dim=-1)  # [M, k]
-    proj_b = torch.sum(diff * axes_b, dim=-1)  # [M, k]
+    proj_a = torch.sum(diff * axes_a_knn, dim=-1)  # [M, k]
+    proj_b = torch.sum(diff * axes_b_knn, dim=-1)  # [M, k]
+    proj_point = proj_a.unsqueeze(-1) * axes_a_knn + proj_b.unsqueeze(-1) * axes_b_knn  # [M, k, 3]
 
-    proj_point = proj_a.unsqueeze(-1) * axes_a + proj_b.unsqueeze(-1) * axes_b  # [M, k, 3]
-
-    scaled_a = proj_a / r_a  # [M, k]
-    scaled_b = proj_b / r_b  # [M, k]
+    scaled_a = proj_a / r_a_knn  # [M, k]
+    scaled_b = proj_b / r_b_knn  # [M, k]
     scale_factor = torch.sqrt(scaled_a**2 + scaled_b**2 + 1e-8)  # [M, k]
 
     closest_a = proj_a / scale_factor  # [M, k]
     closest_b = proj_b / scale_factor  # [M, k]
-    closest_point_boundary = (closest_a.unsqueeze(-1) * axes_a +
-                              closest_b.unsqueeze(-1) * axes_b)  # [M, k, 3]
-
+    closest_point_boundary = (closest_a.unsqueeze(-1) * axes_a_knn +
+                              closest_b.unsqueeze(-1) * axes_b_knn)  # [M, k, 3]
+    
     dist_proj = torch.norm(diff - proj_point, dim=-1)            # [M, k]
     dist_boundary = torch.norm(diff - closest_point_boundary, dim=-1)  # [M, k]
-
+    
     inside_mask = (scaled_a**2 + scaled_b**2) <= 1  # [M, k]
-
     dist = torch.where(inside_mask, dist_proj, dist_boundary)  # [M, k]
 
-    dist_min, idx = torch.min(dist, dim=1)  # both: [M]
+    _, idx = torch.min(dist, dim=1)  # idx: [M]
+    orig_idx = indices[torch.arange(indices.shape[0]), idx]  # [M]
 
-    return dist_min, idx
+    selected_coeffs = sdf_coeffs[orig_idx]  # [M, K]
 
+    selected_means = means_knn[torch.arange(means_knn.shape[0]), idx]  # [M, 3]
+    
+    dirs = selected_means - pos  # [M, 3]
+    depth_harmonics = sdf_harmonics(sh_degree, dirs, selected_coeffs)  # [M]
+    
+    sdf_base = dist[torch.arange(dist.shape[0]), idx]  # [M]
+    dist_min = sdf_base + depth_harmonics
+
+    return dist_min, orig_idx
 
 def signed_distance(
     pos: torch.Tensor,    # [M, 3]

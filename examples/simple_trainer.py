@@ -273,6 +273,12 @@ def create_splats_with_optimizers(
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
+
+        sdf_coeffs = torch.zeros((N, (sh_degree + 1) ** 2))  # [N, K] 
+        sdf_coeffs[:, 0] = 0.0  
+        params.append(("sdf0", torch.nn.Parameter(sdf_coeffs[:, :1]), 2.5e-3))
+        params.append(("sdfN", torch.nn.Parameter(sdf_coeffs[:, 1:]), 2.5e-3 / 20))
+
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -478,6 +484,7 @@ class Runner:
                 mode="training",
             )
 
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -620,11 +627,15 @@ class Runner:
                 points_world = data["points_world"].to(device)  # [1, M, 3]
                 points_world = points_world.squeeze(0)
 
-                points_sample = points_world# [torch.randperm(points_world.shape[0])[:100]]
+                points_sample = points_world#[torch.randperm(points_world.shape[0])[:5000]]
                 means = self.splats["means"]  # [N, 3]
                 quats = self.splats["quats"]
                 scales = torch.exp(self.splats["scales"])
-                r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales)
+                opacities = torch.sigmoid(self.splats["opacities"])
+                r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales, opacities)
+
+                if torch.isnan(means).any():
+                    print("nan encountered")
                 
 
             height, width = pixels.shape[1:3]
@@ -678,10 +689,10 @@ class Runner:
             )
 
             # loss
-            l1loss = F.l1_loss(colors, pixels) 
+            l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            ) 
+            )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # query depths from depth map
@@ -701,12 +712,24 @@ class Runner:
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+                loss += depthloss #* cfg.depth_lambda
 
             if cfg.sdf_loss:
-                sdf, idx = signed_distance_knn(points_sample, means, r_a, r_b, axes_a, axes_b)
+                sdf_coeffs = torch.cat([self.splats["sdf0"], self.splats["sdfN"]], 1)
+                sdf, _ = signed_distance_knn(
+                    pos=points_sample, 
+                    means=means, 
+                    r_a=r_a, 
+                    r_b=r_b, 
+                    axes_a=axes_a, 
+                    axes_b=axes_b, 
+                    sdf_coeffs=sdf_coeffs,
+                    sh_degree=sh_degree_to_use,
+                )
                 sdfloss = F.l1_loss(sdf, torch.zeros_like(sdf))
-                loss += sdfloss * 10 #cfg.sdf_lambda
+                loss += sdfloss #* cfg.sdf_lambda
+                
+
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
@@ -1049,41 +1072,42 @@ class Runner:
             canvas = (canvas * 255).astype(np.uint8)
             writer.append_data(canvas)
         writer.close()
-        writer = imageio.get_writer(f"{video_dir}/traj_sphere_trace_{step}.mp4", fps=30)
-        for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
-            camtoworlds = camtoworlds_all[i : i + 1]
-            Ks = K[None]
-            c2w = camtoworlds.squeeze(0)
-            # Ks = torch.from_numpy(Ks).float().to(device)
+        # writer = imageio.get_writer(f"{video_dir}/traj_sphere_trace_{step}.mp4", fps=30)
+        # for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
+        #     camtoworlds = camtoworlds_all[i : i + 1]
+        #     Ks = K[None]
+        #     c2w = camtoworlds.squeeze(0)
+        #     # Ks = torch.from_numpy(Ks).float().to(device)
 
-            means = self.splats["means"]  # [N, 3]
-            # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-            # rasterization does normalization internally
-            quats = self.splats["quats"]  # [N, 4]
-            scales = torch.exp(self.splats["scales"])  # [N, 3]
+        #     means = self.splats["means"]  # [N, 3]
+        #     # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
+        #     # rasterization does normalization internally
+        #     quats = self.splats["quats"]  # [N, 4]
+        #     scales = torch.exp(self.splats["scales"])  # [N, 3]
+        #     opacities = torch.sigmoid(self.splats["opacities"])
 
-            origins, directions = generate_rays(c2w, K, width, height)
-            r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales)
+        #     origins, directions = generate_rays(c2w, K, width, height)
+        #     r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales, opacities)
 
-            hit_color, total_distance = sphere_trace(
-                means,
-                quats,
-                scales,
-                colors,
-                origins.contiguous(),
-                directions.contiguous(),
-                r_a,
-                r_b,
-                axes_a,
-                axes_b
-            )
-            depth = calculate_depth(K, total_distance, width, height)
-            depth_img = generate_depth_image(depth, total_distance, 15.0)
-            rendered_image = depth_img.cpu().numpy()
-            render = (rendered_image * 255).astype(np.uint8)
-            writer.append_data(render)
+        #     hit_color, total_distance = sphere_trace(
+        #         means,
+        #         quats,
+        #         scales,
+        #         colors,
+        #         origins.contiguous(),
+        #         directions.contiguous(),
+        #         r_a,
+        #         r_b,
+        #         axes_a,
+        #         axes_b
+        #     )
+        #     depth = calculate_depth(K, total_distance, width, height)
+        #     depth_img = generate_depth_image(depth, total_distance, 25.0)
+        #     rendered_image = depth_img.cpu().numpy()
+        #     render = (rendered_image * 255).astype(np.uint8)
+        #     writer.append_data(render)
 
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
+        # print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
     def run_compression(self, step: int):
