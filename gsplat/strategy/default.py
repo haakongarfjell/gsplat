@@ -151,6 +151,9 @@ class DefaultStrategy(Strategy):
 
     def step_post_backward(
         self,
+        id_to_count,
+        gaussian_ids_all,
+        sdf_pruning,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
@@ -169,6 +172,23 @@ class DefaultStrategy(Strategy):
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
+            # prune GSs
+            n_prune = self._prune_gs(
+                id_to_count,
+                gaussian_ids_all,
+                sdf_pruning,
+                params, 
+                optimizers, 
+                state, 
+                step
+            )
+            id_to_count.clear()
+            if self.verbose:
+                print(
+                    f"Step {step}: {n_prune} GSs pruned. "
+                    f"Now having {len(params['means'])} GSs."
+                )
+
             # grow GSs
             n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
             if self.verbose:
@@ -176,14 +196,9 @@ class DefaultStrategy(Strategy):
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
                     f"Now having {len(params['means'])} GSs."
                 )
-
-            # prune GSs
-            n_prune = self._prune_gs(params, optimizers, state, step)
-            if self.verbose:
-                print(
-                    f"Step {step}: {n_prune} GSs pruned. "
-                    f"Now having {len(params['means'])} GSs."
-                )
+            #     new_gaussian_ids_set = set(range(len(gaussian_ids_all), (len(gaussian_ids_all) + num_new_ids)))
+            #     gaussian_ids_all.update(new_gaussian_ids_set)
+            #     id_to_count.clear()
 
             # reset running stats
             state["grad2d"].zero_()
@@ -199,6 +214,8 @@ class DefaultStrategy(Strategy):
                 state=state,
                 value=self.prune_opa * 2.0,
             )
+
+
 
     def _update_state(
         self,
@@ -260,6 +277,7 @@ class DefaultStrategy(Strategy):
                 radii / float(max(info["width"], info["height"])),
             )
 
+
     @torch.no_grad()
     def _grow_gs(
         self,
@@ -307,17 +325,22 @@ class DefaultStrategy(Strategy):
                 mask=is_split,
                 revised_opacity=self.revised_opacity,
             )
+
         return n_dupli, n_split
 
     @torch.no_grad()
     def _prune_gs(
         self,
+        id_to_count,
+        gaussian_ids_all,
+        sdf_pruning,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
         step: int,
     ) -> int:
         is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
+
         if step > self.reset_every:
             is_too_big = (
                 torch.exp(params["scales"]).max(dim=-1).values
@@ -333,8 +356,21 @@ class DefaultStrategy(Strategy):
 
             is_prune = is_prune | is_too_big
 
+        if sdf_pruning:
+            #print min and max id_to_count value
+
+            lowest_ids = [gid for gid, cnt in id_to_count.items() if cnt < 2]
+            if lowest_ids:
+                lowest_ids_tensor = torch.tensor(lowest_ids, dtype=torch.long, device=is_prune.device)
+                is_prune[lowest_ids_tensor] = True
+
+            pruned_ids = torch.nonzero(is_prune).flatten().tolist()
+            for gid in pruned_ids:
+                gaussian_ids_all.discard(gid)
+
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
 
+      
         return n_prune

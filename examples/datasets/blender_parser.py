@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from typing_extensions import assert_never
 from scipy.spatial.transform import Rotation
 
-
+import open3d as o3d
 import cv2
 import imageio.v2 as imageio
 import numpy as np
@@ -72,15 +72,37 @@ def cam_to_world_points(points_camera, c2w, H, W):
 
     return points_world
 
-def voxel_downsample_unique(points, rgbs, voxel_size):
-    voxel_indices = np.floor(points / voxel_size).astype(np.int32)
+def voxel_downsample_unique(points, rgbs, normals, num_bins=50):
+
+    min_coords = points.min(axis=0)
+    max_coords = points.max(axis=0)
     
-    dtype = np.dtype((np.void, voxel_indices.dtype.itemsize * voxel_indices.shape[1]))
-    voxel_indices_view = np.ascontiguousarray(voxel_indices).view(dtype)
+    edges = [np.linspace(min_coords[d], max_coords[d], int(num_bins)+1) for d in range(3)]
     
-    _, unique_idx = np.unique(voxel_indices_view, return_index=True)
+    bin_x = np.digitize(points[:, 0], edges[0]) - 1
+    bin_y = np.digitize(points[:, 1], edges[1]) - 1
+    bin_z = np.digitize(points[:, 2], edges[2]) - 1
     
-    return points[unique_idx], rgbs[unique_idx]
+    bin_x = np.clip(bin_x, 0, num_bins-1)
+    bin_y = np.clip(bin_y, 0, num_bins-1)
+    bin_z = np.clip(bin_z, 0, num_bins-1)
+    
+    cell_indices = np.stack([bin_x, bin_y, bin_z], axis=1)
+    
+    cell_dict = {}
+    for idx, cell in enumerate(map(tuple, cell_indices)):
+        if cell not in cell_dict:
+            cell_dict[cell] = []
+        cell_dict[cell].append(idx)
+    
+    selected_idx = []
+    for cell, indices in cell_dict.items():
+
+        selected_idx.append(indices[0])
+    
+    selected_idx = np.array(selected_idx)
+    
+    return points[selected_idx], rgbs[selected_idx], normals[selected_idx]
 
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
@@ -92,7 +114,7 @@ def _get_rel_paths(path_dir: str) -> List[str]:
 
 
 class Parser:
-    """COLMAP parser."""
+
 
     def __init__(
         self,
@@ -114,9 +136,15 @@ class Parser:
 
         K = np.array([
             [1111.111111,      0, 400.0],
-            [      0,   1666.666667, 400.0],
+            [      0,   1111.111111, 400.0],
             [      0,          0,     1.0]
         ])
+
+        # K = np.array([
+        #     [1111.111111,      0, 400.0],
+        #     [      0,   1666.666667, 400.0],
+        #     [      0,          0,     1.0]
+        # ])
         K[:2, :] /= factor
         
         cams = np.loadtxt(cam_path, delimiter=",", comments="#")
@@ -148,6 +176,7 @@ class Parser:
 
         points3D = []
         rgbs = []
+        normals3D = []
         points_per_image = dict()
         for i in range(1, N):
             if i < 9:
@@ -181,7 +210,7 @@ class Parser:
             points_camera = pixel_to_camera(u, v, z, K)
 
             points_world = cam_to_world_points(points_camera, camtoworlds[i], H, W)
-            valid_indices = (z > 0) & (z < 1000)
+            valid_indices = (z > 0) & (z < 5000)
 
             points_world = points_world[valid_indices]
             rgb = rgb[valid_indices]
@@ -190,6 +219,14 @@ class Parser:
 
             points3D.append(points_world)
             rgbs.append(rgb)
+            
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points_world)
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30))
+            pcd.orient_normals_towards_camera_location(camtoworlds[i][:3, 3])
+            normals_world = np.asarray(pcd.normals)
+            normals3D.append(normals_world)
+
 
         print(
             f"[Parser] {N} images, taken by {len(set(camera_ids))} cameras."
@@ -197,9 +234,7 @@ class Parser:
 
         points3D = np.concatenate(points3D, axis=0).reshape(-1, 3)
         rgbs = np.concatenate(rgbs, axis=0).reshape(-1, 3)
-        print(points3D.shape)
-        print(rgbs.shape)
-        
+        normals_all = np.concatenate(normals3D, axis=0).reshape(-1, 3)
 
         w2c_mats = np.stack(w2c_mats, axis=0)
 
@@ -242,7 +277,7 @@ class Parser:
 
         image_paths = [os.path.join(data_dir, "exr_files", f"{img_id}.exr") for img_id in image_names]
 
-        points, points_rgb = voxel_downsample_unique(points3D, rgbs, 0.1)
+        points, points_rgb, normals = voxel_downsample_unique(points3D, rgbs, normals_all)
 
         points_err = np.zeros(points.shape[0], dtype=np.float32)
 
@@ -281,6 +316,7 @@ class Parser:
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
+        self.normals = normals  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
         self.points_per_image = points_per_image  # Dict[str, np.ndarray], image_name -> [M, 3]

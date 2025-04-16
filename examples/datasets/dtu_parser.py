@@ -2,7 +2,9 @@ import os
 import json
 from typing import Any, Dict, List, Optional
 from typing_extensions import assert_never
+from scipy.spatial.transform import Rotation
 
+import open3d as o3d
 import cv2
 import imageio.v2 as imageio
 import numpy as np
@@ -16,6 +18,160 @@ from .normalize import (
     transform_points,
 )
 
+import re
+
+def read_pfm(filename):
+    file = open(filename, 'rb')
+    color = None
+    width = None
+    height = None
+    scale = None
+    endian = None
+
+    header = file.readline().decode('utf-8').rstrip()
+    if header == 'PF':
+        color = True
+    elif header == 'Pf':
+        color = False
+    else:
+        raise Exception('Not a PFM file.')
+
+    dim_match = re.match(r'^(\d+)\s(\d+)\s$', file.readline().decode('utf-8'))
+    if dim_match:
+        width, height = map(int, dim_match.groups())
+    else:
+        raise Exception('Malformed PFM header.')
+
+    scale = float(file.readline().rstrip())
+    if scale < 0:  # little-endian
+        endian = '<'
+        scale = -scale
+    else:
+        endian = '>'  # big-endian
+
+    data = np.fromfile(file, endian + 'f')
+    shape = (height, width, 3) if color else (height, width)
+
+    data = np.reshape(data, shape) * 1/200
+    data = np.flipud(data)
+    file.close()
+    return data, scale
+
+def read_cam(filepath):
+
+    with open(filepath, "r") as f:
+        lines = [line.strip() for line in f if line.strip() != ""]
+    
+    if lines[0].lower() != "extrinsic":
+        raise ValueError("File format error: The first non-empty line must be 'extrinsic'")
+    
+    extrinsic = np.array([list(map(float, line.split())) for line in lines[1:5]])
+    
+    if lines[5].lower() != "intrinsic":
+        raise ValueError("File format error: Expected 'intrinsic' after extrinsic matrix data.")
+    
+    intrinsic = np.array([list(map(float, line.split())) for line in lines[6:9]])
+    
+    intrinsic[:2] *= 4
+
+    extrinsic[:3, 3] *= 1/200
+
+
+    extra_params = np.array(list(map(float, lines[9].split())))
+
+    depth_min = extra_params[0] * 1/200
+    depth_max = depth_min + extra_params[1] * 192 * 1/200
+
+    extra_params[0] = depth_max
+    extra_params[1] = depth_min
+    
+    return extrinsic, intrinsic, extra_params
+
+def unproject_depths(depth, image, w2c, K, near_fars):
+    
+    depth_h, depth_w = depth.shape  # (128, 160)
+    # Image resolution:
+    image_h, image_w = image.shape[0], image.shape[1]  # (512, 640)
+
+    # Compute scaling factors:
+    scale_x = image_w / depth_w  # 640 / 160 = 4
+    scale_y = image_h / depth_h  # 512 / 128 = 4
+
+    v_depth, u_depth = np.meshgrid(np.arange(depth_h), np.arange(depth_w), indexing='ij')
+    u_img = u_depth * scale_x
+    v_img = v_depth * scale_y
+
+
+    u_img_flat = u_img.flatten()
+    v_img_flat = v_img.flatten()
+    depth_flat = depth.flatten() 
+
+    far = near_fars[0]
+    near = near_fars[1]
+
+    valid = (depth_flat >= near) & (depth_flat <= far)
+
+    # Apply filtering to the pixel coordinates and depth values
+    u_img_flat = u_img_flat[valid]
+    v_img_flat = v_img_flat[valid]
+    depth_flat = depth_flat[valid]
+
+    fx = K[0,0]
+    fy = K[1,1]
+    cx = K[0,2]
+    cy = K[1,2]
+
+    X = (u_img_flat - cx) * depth_flat / fx
+    Y = (v_img_flat - cy) * depth_flat / fy
+    Z = depth_flat
+
+    points_camera = np.stack([X, Y, Z], axis=-1)
+
+    w2c_inv = np.linalg.inv(w2c)
+    points_cam_hom = np.concatenate([points_camera, np.ones((points_camera.shape[0], 1))], axis=-1)
+    points_world_hom = (w2c_inv @ points_cam_hom.T).T
+    points_world = points_world_hom[:, :3] / points_world_hom[:, 3:4]
+
+    u_indices = np.round(u_img_flat).astype(np.int32)
+    v_indices = np.round(v_img_flat).astype(np.int32)
+    
+    # It is important to check that the indices are in range.
+    # (In theory they are, if the downsampling/cropping is aligned.)
+    colors = image[v_indices, u_indices, :]  # image is indexed as [row, col]
+
+    return points_world, colors
+
+def voxel_downsample_unique(points, rgbs, normals, num_bins=50):
+
+    min_coords = points.min(axis=0)
+    max_coords = points.max(axis=0)
+    
+    edges = [np.linspace(min_coords[d], max_coords[d], int(num_bins)+1) for d in range(3)]
+    
+    bin_x = np.digitize(points[:, 0], edges[0]) - 1
+    bin_y = np.digitize(points[:, 1], edges[1]) - 1
+    bin_z = np.digitize(points[:, 2], edges[2]) - 1
+    
+    bin_x = np.clip(bin_x, 0, num_bins-1)
+    bin_y = np.clip(bin_y, 0, num_bins-1)
+    bin_z = np.clip(bin_z, 0, num_bins-1)
+    
+    cell_indices = np.stack([bin_x, bin_y, bin_z], axis=1)
+    
+    cell_dict = {}
+    for idx, cell in enumerate(map(tuple, cell_indices)):
+        if cell not in cell_dict:
+            cell_dict[cell] = []
+        cell_dict[cell].append(idx)
+    
+    selected_idx = []
+    for cell, indices in cell_dict.items():
+
+        selected_idx.append(indices[0])
+    
+    selected_idx = np.array(selected_idx)
+    
+    return points[selected_idx], rgbs[selected_idx], normals[selected_idx]
 
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
@@ -27,7 +183,7 @@ def _get_rel_paths(path_dir: str) -> List[str]:
 
 
 class Parser:
-    """COLMAP parser."""
+
 
     def __init__(
         self,
@@ -40,90 +196,89 @@ class Parser:
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
+        
+        depths_dir = os.path.join(data_dir, "Depths/scan24_train")
+        image_dir = os.path.join(data_dir, "Rectified")
+        #mask_dir = os.path.join(data_dir, "mask")
+        cam_dir = os.path.join(data_dir, "Cameras/train")
 
-        colmap_dir = os.path.join(data_dir, "sparse/0/")
-        if not os.path.exists(colmap_dir):
-            colmap_dir = os.path.join(data_dir, "sparse")
-        assert os.path.exists(
-            colmap_dir
-        ), f"COLMAP directory {colmap_dir} does not exist."
 
-        manager = SceneManager(colmap_dir)
-        manager.load_cameras()
-        manager.load_images()
-        manager.load_points3D()
 
-        # Extract extrinsic matrices in world-to-camera format.
-        imdata = manager.images
         w2c_mats = []
         camera_ids = []
         Ks_dict = dict()
         params_dict = dict()
         imsize_dict = dict()  # width, height
         mask_dict = dict()
-        bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
-        for k in imdata:
-            im = imdata[k]
-            rot = im.R()
-            trans = im.tvec.reshape(3, 1)
-            w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
-            w2c_mats.append(w2c)
+        image_names = []
 
-            # support different camera intrinsics
-            camera_id = im.camera_id
+        points3D = []
+        rgbs = []
+        normals3D = []
+        points_per_image = dict()
+
+        N = 49
+        for image_number in range(0, N):
+
+            depth_name = f"{image_number:04d}"
+            image_name = f"{(image_number+1):03d}"
+            img_id = image_name
+            #mask_name = f"{(image_number):03d}"
+            cam_name = f"{image_number:08}"
+
+            depth_path = os.path.join(depths_dir, f"depth_map_{depth_name}.pfm")
+            image_path = os.path.join(image_dir, f"rect_{image_name}_3_r5000.png")
+            #mask_path  = os.path.join(mask_dir, f"{mask_name}.png")
+            cam_path = os.path.join(cam_dir, f"{cam_name}_cam.txt")
+            
+            image_names.append(image_name)
+
+            depth, scale = read_pfm(depth_path)
+            image = imageio.imread(image_path)
+            w2c, K, near_fars = read_cam(cam_path)
+            c2w = np.linalg.inv(w2c)
+
+            H, W = image.shape[0], image.shape[1]
+            w2c_mats.append(w2c)
+            camera_id = image_number
             camera_ids.append(camera_id)
 
-            # camera intrinsics
-            cam = manager.cameras[camera_id]
-            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
-            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-            K[:2, :] /= factor
+            fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
             Ks_dict[camera_id] = K
 
-            # Get distortion parameters.
-            type_ = cam.camera_type
-            if type_ == 0 or type_ == "SIMPLE_PINHOLE":
-                params = np.empty(0, dtype=np.float32)
-                camtype = "perspective"
-            elif type_ == 1 or type_ == "PINHOLE":
-                params = np.empty(0, dtype=np.float32)
-                camtype = "perspective"
-            if type_ == 2 or type_ == "SIMPLE_RADIAL":
-                params = np.array([cam.k1, 0.0, 0.0, 0.0], dtype=np.float32)
-                camtype = "perspective"
-            elif type_ == 3 or type_ == "RADIAL":
-                params = np.array([cam.k1, cam.k2, 0.0, 0.0], dtype=np.float32)
-                camtype = "perspective"
-            elif type_ == 4 or type_ == "OPENCV":
-                params = np.array([cam.k1, cam.k2, cam.p1, cam.p2], dtype=np.float32)
-                camtype = "perspective"
-            elif type_ == 5 or type_ == "OPENCV_FISHEYE":
-                params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
-                camtype = "fisheye"
-            assert (
-                camtype == "perspective" or camtype == "fisheye"
-            ), f"Only perspective and fisheye cameras are supported, got {type_}"
+            params = np.empty(0, dtype=np.float32)
+            camtype = "perspective"
 
             params_dict[camera_id] = params
-            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
+            imsize_dict[camera_id] = (W // factor, H // factor)
             mask_dict[camera_id] = None
+
+            points_world, rgb = unproject_depths(depth, image, w2c, K, near_fars)
+            points_per_image[img_id] = points_world
+
+            points3D.append(points_world)
+            rgbs.append(rgb)
+            
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points_world)
+            pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30))
+            pcd.orient_normals_towards_camera_location(c2w[:3, 3])
+            normals_world = np.asarray(pcd.normals)
+            normals3D.append(normals_world)
+
+
         print(
-            f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
+            f"[Parser] {N} images, taken by {len(set(camera_ids))} cameras."
         )
 
-        if len(imdata) == 0:
-            raise ValueError("No images found in COLMAP.")
-        if not (type_ == 0 or type_ == 1):
-            print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
+        points3D = np.concatenate(points3D, axis=0).reshape(-1, 3)
+        rgbs = np.concatenate(rgbs, axis=0).reshape(-1, 3)
+        normals_all = np.concatenate(normals3D, axis=0).reshape(-1, 3)
 
         w2c_mats = np.stack(w2c_mats, axis=0)
 
         # Convert extrinsics to camera-to-world.
         camtoworlds = np.linalg.inv(w2c_mats)
-
-        # Image names from COLMAP. No need for permuting the poses according to
-        # image names anymore.
-        image_names = [imdata[k].name for k in imdata]
 
         # Previous Nerf results were generated with images sorted by filename,
         # ensure metrics are reported on the same test set.
@@ -153,31 +308,24 @@ class Parser:
             image_dir_suffix = f"_{factor}"
         else:
             image_dir_suffix = ""
-        colmap_image_dir = os.path.join(data_dir, "images")
-        image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
+        colmap_image_dir = os.path.join(data_dir, "Rectified")
+        image_dir = os.path.join(data_dir, "Rectified" + image_dir_suffix)
         for d in [image_dir, colmap_image_dir]:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
 
-        # Downsampled images may have different names vs images used for COLMAP,
-        # so we need to map between the two sorted lists of files.
-        colmap_files = sorted(_get_rel_paths(colmap_image_dir))
-        image_files = sorted(_get_rel_paths(image_dir))
-        colmap_to_image = dict(zip(colmap_files, image_files))
-        image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        image_paths = [os.path.join(data_dir, "Rectified", f"{img_id}.png") for img_id in image_names]
 
-        # 3D points and {image_name -> [point_idx]}
-        points = manager.points3D.astype(np.float32)
-        points_err = manager.point3D_errors.astype(np.float32)
-        points_rgb = manager.point3D_colors.astype(np.uint8)
+        points, points_rgb, normals = voxel_downsample_unique(points3D, rgbs, normals_all)
+
+        points_err = np.zeros(points.shape[0], dtype=np.float32)
+
         point_indices = dict()
+        
+        for i, img_id in enumerate(image_names):
+            image_name = img_id
+            point_indices.setdefault(image_name, [])
 
-        image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
-        for point_id, data in manager.point3D_id_to_images.items():
-            for image_id, _ in data:
-                image_name = image_id_to_name[image_id]
-                point_idx = manager.point3D_id_to_point3D_idx[point_id]
-                point_indices.setdefault(image_name, []).append(point_idx)
         point_indices = {
             k: np.array(v).astype(np.int32) for k, v in point_indices.items()
         }
@@ -207,20 +355,21 @@ class Parser:
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
+        self.normals = normals  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
+        self.points_per_image = points_per_image  # Dict[str, np.ndarray], image_name -> [M, 3]
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.
-        actual_image = imageio.imread(self.image_paths[0])[..., :3]
-        actual_height, actual_width = actual_image.shape[:2]
+        actual_height, actual_width = (H, W)
         colmap_width, colmap_height = self.imsize_dict[self.camera_ids[0]]
         s_height, s_width = actual_height / colmap_height, actual_width / colmap_width
         for camera_id, K in self.Ks_dict.items():
             K[0, :] *= s_width
             K[1, :] *= s_height
             self.Ks_dict[camera_id] = K
-            width, height = self.imsize_dict[camera_id]
+            width, height = (H, W)
             self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
 
         # undistortion
@@ -308,11 +457,13 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        sdf_loss: bool = False,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.sdf_loss = sdf_loss
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -324,7 +475,12 @@ class Dataset:
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        img_name_full = f"{self.parser.data_dir}/Rectified/rect_{self.parser.image_names[index]}_3_r5000.png"
+
+        image = imageio.imread(img_name_full)[..., :3]
+
+        image = (image * 255).astype(np.uint8)
+        
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
@@ -384,6 +540,12 @@ class Dataset:
             data["depths"] = torch.from_numpy(depths).float()
             data["points_world"] = torch.from_numpy(points_world).float()
 
+        if self.sdf_loss:
+            image_name = self.parser.image_names[index]
+            points_world = self.parser.points_per_image[image_name]
+            data["points_world"] = torch.from_numpy(points_world).float()
+            
+
         return data
 
 
@@ -402,7 +564,7 @@ if __name__ == "__main__":
     parser = Parser(
         data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
     )
-    dataset = Dataset(parser, split="train", load_depths=True)
+    dataset = Dataset(parser, split="train", load_depths=True, sdf_loss=True)
     print(f"Dataset: {len(dataset)} images.")
 
     writer = imageio.get_writer("results/points.mp4", fps=30)

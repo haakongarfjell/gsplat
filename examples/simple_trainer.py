@@ -15,7 +15,9 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.colmap import Dataset, Parser
+# from datasets.colmap import Dataset, Parser
+# from datasets.blender_parser import Dataset, Parser
+from datasets.dtu_parser import Dataset, Parser
 from datasets.traj import (
     generate_interpolated_path,
     generate_ellipse_path_z,
@@ -42,7 +44,24 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 from gsplat.utils import save_ply
+from gsplat.cuda._torch_impl import (
+    generate_rays,
+    gaussian_to_ellipse,
+    signed_distance_knn,
+    hessian_loss,
+    filter_scales,
+    update_id_to_count,
+    outer_ellipsoid,
+    surface_consistency_loss,
+    normals_to_quats,
+)
+from gsplat.cuda._wrapper import(
+    sphere_trace
+)
+from pytorch3d.transforms import matrix_to_quaternion
+torch.autograd.set_detect_anomaly(True)
 
+import mesh_extract
 
 @dataclass
 class Config:
@@ -68,7 +87,7 @@ class Config:
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
-    normalize_world_space: bool = True
+    normalize_world_space: bool = False # True
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -115,10 +134,11 @@ class Config:
 
     # Strategy for GS densification
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+        # default_factory=DefaultStrategy
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
-    packed: bool = False
+    packed: bool = True
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
@@ -159,13 +179,26 @@ class Config:
 
     # Enable depth loss. (experimental)
     depth_loss: bool = False
+
+    sdf_loss: bool = False
+    
+    sdf_pruning: bool = False
+
+    sdf_lambda: float = 1e-2
+
+    hessian_lambda: float = 1e-8
+
+    alpha_threshold: float = 0.0
+
+    eikonal_lambda: float = 1e-4 * 2
     # Weight for depth loss
-    depth_lambda: float = 1e-2
+    depth_lambda: float = 1e-4 * 2
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
     tb_save_image: bool = False
+
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
@@ -189,7 +222,6 @@ class Config:
         else:
             assert_never(strategy)
 
-
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -209,6 +241,7 @@ def create_splats_with_optimizers(
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
+        #normals = torch.from_numpy(parser.normals).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
@@ -216,18 +249,31 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
+
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
+    #tangent_scale = torch.log(dist_avg * init_scale)  # shape: (N,)
+    # Set a small constant for the normal's scale.
+    #normal_scale = tangent_scale * 1e-3  # shape: (N,)
+
+    #scales = torch.stack([tangent_scale, tangent_scale, normal_scale], dim=1)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+    # U, S, Vh = torch.linalg.svd(covars)
+    # quats = matrix_to_quaternion(U)
+    # quats = F.normalize(quats, p=2, dim=-1)
+    # scales = 1. / torch.sqrt(S)
+    # scales = torch.log(scales)
+
+    # # Distribute the GSs to different ranks (also works for single rank)
+    # points = points[world_rank::world_size]
+    # rgbs = rgbs[world_rank::world_size]
+    # scales = scales[world_rank::world_size]
 
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
+    #quats = normals_to_quats(normals)  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
     params = [
@@ -244,6 +290,12 @@ def create_splats_with_optimizers(
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
+
+        sdf_coeffs = torch.zeros((N, (sh_degree + 1) ** 2))  # [N, K] 
+        sdf_coeffs[:, 0] = 0.0  
+        params.append(("sdf0", torch.nn.Parameter(sdf_coeffs[:, :1]), 2.5e-3))
+        params.append(("sdfN", torch.nn.Parameter(sdf_coeffs[:, 1:]), 2.5e-3 / 20))
+
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -275,20 +327,35 @@ def create_splats_with_optimizers(
     }
     return splats, optimizers
 
-
+import open3d as o3d
 class Runner:
     """Engine for training and testing."""
+
+
 
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
         set_random_seed(42 + local_rank)
 
+
         self.cfg = cfg
         self.world_rank = world_rank
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
+
+        self.sdf_gaussians = set()
+
+        ptcloud_path = "/home/admin/haakon/gsplat/examples/data/monkey_depth/ptcloud.ply"
+        if not os.path.exists(ptcloud_path):
+            raise FileNotFoundError(f"Points file not found: {ptcloud_path}")
+        
+        ptcloud = o3d.io.read_point_cloud(ptcloud_path)
+        ptcloud = np.asarray(ptcloud.points)
+        
+        ptcloud = torch.tensor(ptcloud, device=self.device, dtype=torch.float32)
+        self.ptcloud = ptcloud
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -318,6 +385,7 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            sdf_loss=cfg.sdf_loss,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -448,6 +516,7 @@ class Runner:
                 mode="training",
             )
 
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -558,7 +627,9 @@ class Runner:
         )
         trainloader_iter = iter(trainloader)
 
-        # Training loop.
+        # Training loop.        
+        self.id_to_count = {}    
+        self.gaussian_ids_all = set(range(self.splats["means"].shape[0]))
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
@@ -582,9 +653,36 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            gt_alpha = data["gt_alpha"].to(device) if "gt_alpha" in data else None  # [1, H, W]
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+
+            if cfg.sdf_loss:
+                points_world = data["points_world"].to(device)  # [1, M, 3]
+                points_world = points_world.squeeze(0)
+
+                points_sample = points_world.clone().detach().requires_grad_(True)#[torch.randperm(points_world.shape[0])[:5000]]
+                means = self.splats["means"]  # [N, 3]
+                quats = self.splats["quats"]
+                scales = torch.exp(self.splats["scales"])
+                opacities = torch.sigmoid(self.splats["opacities"])
+                sdf_coeffs = torch.cat([self.splats["sdf0"], self.splats["sdfN"]], 1)
+
+                # means, quats, scales, opacities, sdf_coeffs = filter_scales(
+                #     means=means,
+                #     quats=quats,
+                #     scales=scales,
+                #     opacities=opacities,
+                #     sdf_coeffs=sdf_coeffs,
+                #     alpha_thresh=cfg.alpha_threshold,
+                # )
+
+                r_a, r_b, axes_a, axes_b, normals = gaussian_to_ellipse(means, quats, scales, opacities)
+
+                # if torch.isnan(means).any():
+                #     n_nans = torch.isnan(means).sum().item()
+                #     print(f"Nan elements {n_nans}")
 
             height, width = pixels.shape[1:3]
 
@@ -610,6 +708,7 @@ class Runner:
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
             )
+
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
@@ -642,6 +741,10 @@ class Runner:
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+            # if gt_alpha is not None:
+            #     alpha_loss = F.l1_loss(alphas, gt_alpha)
+            #     loss += alpha_loss
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -660,7 +763,76 @@ class Runner:
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+                loss += depthloss #* cfg.depth_lambda
+
+            if cfg.sdf_loss:
+                # sdf, _ = signed_distance_knn(
+                #     pos=points_sample, 
+                #     means=means, 
+                #     r_a=r_a, 
+                #     r_b=r_b, 
+                #     axes_a=axes_a, 
+                #     axes_b=axes_b, 
+                #     sdf_coeffs=sdf_coeffs,
+                #     sh_degree=0,
+                # )
+                # sdfloss = F.l1_loss(sdf, torch.zeros_like(sdf))
+                # eikonalloss = eikonal_loss(
+                #     pos=points_sample,
+                #     sdf=sdf
+                # )
+
+                def sdf_fn(pos_sample: torch.Tensor) -> torch.Tensor:
+                    sdf_values, idx = signed_distance_knn(
+                        pos=pos_sample,
+                        means=means,
+                        r_a=r_a,
+                        r_b=r_b,
+                        axes_a=axes_a,
+                        axes_b=axes_b,
+                        sdf_coeffs=sdf_coeffs,
+                        sh_degree=sh_degree_to_use,
+                        max_threshold=None
+                    )
+                    return sdf_values, idx
+
+                # # Use this to compute Hessian loss
+                # sdfloss, idx = hessian_loss(
+                #     means=means,
+                #     normals=normals,
+                #     pos=points_sample,
+                #     sdf_fn=sdf_fn
+                # )
+
+                sdfloss, L_d, L_v, sdf_vals, idx = surface_consistency_loss(
+                    pos=points_sample,
+                    means=means,
+                    global_normals=normals,
+                    sdf_fn=sdf_fn,
+                )
+
+                max_sdf = torch.max(sdf_vals)
+
+                loss += sdfloss * cfg.sdf_lambda #+ L_d * cfg.eikonal_lambda + L_v * cfg.eikonal_lambda
+                gaussian_ids_all = set(range(self.splats["means"].shape[0]))
+                
+                self.id_to_count = update_id_to_count(self.id_to_count, gaussian_ids_all, idx)
+                #self.sdf_counter[idx] += 1
+                # self.sdf_gaussians.update(unique_idx)
+                # hessianloss = hessian_loss(
+                #     pos=points_sample,
+                #     sdf=sdf
+                # )
+                # loss += sdfloss * cfg.sdf_lambda  + eikonalloss * cfg.eikonal_lambda
+                # if torch.isnan(hessianloss):
+                # loss += sdfloss * cfg.sdf_lambda 
+                # else:
+                #loss += sdfloss * cfg.sdf_lambda #+ hessianloss * cfg.hessian_lambda #+ dist_cons * 0.0002 + normal_cons * 0.0002
+                #hessianloss = torch.zeros_like(sdfloss)
+
+            # if step % 100 == 0:
+            #     print(f"Step {step}: {len(self.sdf_gaussians)} unique SDF Gaussians")                
+
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
@@ -683,6 +855,12 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if cfg.sdf_loss:
+                desc += f"L_sdf={sdfloss.item():.6f}| "
+                # desc += f"eikonal loss={eikonalloss.item():.6f}| "
+                desc += f"max_sdf={max_sdf.item():.6f}| "
+                desc += f"L_d={L_d.item():.6f}| "
+                desc += f"L_v={L_v.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -707,6 +885,8 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if cfg.sdf_loss:
+                    self.writer.add_scalar("train/sdfloss", sdfloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -743,6 +923,24 @@ class Runner:
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+
+
+
+                # unique_indices = torch.tensor(list(self.sdf_gaussians), dtype=torch.long, device=means.device)
+                mesh_extractor = mesh_extract.MeshExtract(
+                    data_dir=cfg.data_dir,
+                    result_dir=cfg.result_dir,
+                    ckpt=f"ckpts/ckpt_{step}_rank{self.world_rank}.pt",
+                    gt_mesh_dir="results/meshes/monkey.ply",
+                    #unique_indices=unique_indices,
+                    sdf_loss=cfg.sdf_loss,
+                    alpha_threshold=cfg.alpha_threshold,
+                    step=step,
+                )
+                # mesh_extractor.extract_rasterization()
+                mesh_extractor.extract_marching_cubes()
+                #mesh_extractor.compute_chamfer_distance()
+
             if (
                 step in [i - 1 for i in cfg.ply_steps]
                 or step == max_steps - 1
@@ -809,6 +1007,9 @@ class Runner:
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
+                    self.id_to_count,
+                    self.gaussian_ids_all,
+                    cfg.sdf_pruning,
                     params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,
@@ -999,7 +1200,44 @@ class Runner:
             canvas = (canvas * 255).astype(np.uint8)
             writer.append_data(canvas)
         writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
+        
+        
+        # writer = imageio.get_writer(f"{video_dir}/traj_sphere_trace_{step}.mp4", fps=30)
+        # for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
+        #     camtoworlds = camtoworlds_all[i : i + 1]
+        #     Ks = K[None]
+        #     c2w = camtoworlds.squeeze(0)
+        #     # Ks = torch.from_numpy(Ks).float().to(device)
+
+        #     means = self.splats["means"]  # [N, 3]
+        #     # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
+        #     # rasterization does normalization internally
+        #     quats = self.splats["quats"]  # [N, 4]
+        #     scales = torch.exp(self.splats["scales"])  # [N, 3]
+        #     opacities = torch.sigmoid(self.splats["opacities"])
+
+        #     origins, directions = generate_rays(c2w, K, width, height)
+        #     r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales, opacities)
+
+        #     hit_color, total_distance = sphere_trace(
+        #         means,
+        #         quats,
+        #         scales,
+        #         colors,
+        #         origins.contiguous(),
+        #         directions.contiguous(),
+        #         r_a,
+        #         r_b,
+        #         axes_a,
+        #         axes_b
+        #     )
+        #     depth = calculate_depth(K, total_distance, width, height)
+        #     depth_img = generate_depth_image(depth, total_distance, 25.0)
+        #     rendered_image = depth_img.cpu().numpy()
+        #     render = (rendered_image * 255).astype(np.uint8)
+        #     writer.append_data(render)
+
+        # print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
     def run_compression(self, step: int):
@@ -1033,7 +1271,7 @@ class Runner:
             camtoworlds=c2w[None],
             Ks=K[None],
             width=W,
-            height=H,
+            height=H,   
             sh_degree=self.cfg.sh_degree,  # active all SH degrees
             radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
         )  # [1, H, W, 3]

@@ -821,25 +821,95 @@ def generate_rays(
 
     return origins, directions
 
+from scipy.stats import chi2
+import math
+from scipy.spatial.transform import Rotation as R
+def rotmat_to_quat(R_tensor: torch.Tensor) -> torch.Tensor:
+    R_np = R_tensor.cpu().numpy()  # shape: (N, 3, 3)
+    
+    rot_obj = R.from_matrix(R_np)
+    quats_np = rot_obj.as_quat()  
+    
+    quats_np = np.concatenate([quats_np[:, -1:], quats_np[:, :-1]], axis=1)
+    
+    quats_tensor = torch.from_numpy(quats_np).to(R_tensor.device, dtype=R_tensor.dtype)  # shape: (N, 4)
+    return quats_tensor
+
+def normals_to_quats(normals: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+
+    N = normals.shape[0]
+    candidate = torch.zeros_like(normals)
+    candidate[:, 0] = 1.0
+    mask = (torch.abs(normals[:, 0]) > 0.9)
+    candidate[mask] = torch.tensor([0.0, 1.0, 0.0], device=normals.device)
+    
+    tangent1 = torch.cross(normals, candidate, dim=1)
+    tangent1 = tangent1 / (torch.norm(tangent1, dim=1, keepdim=True) + eps)
+    
+    tangent2 = torch.cross(normals, tangent1, dim=1)
+    tangent2 = tangent2 / (torch.norm(tangent2, dim=1, keepdim=True) + eps)
+    
+    R = torch.stack([tangent1, tangent2, normals], dim=2)  # shape: [N, 3, 3]
+    
+    quats = rotmat_to_quat(R)  # shape: [N, 4]
+    return quats
+
+def filter_scales(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    scales: torch.Tensor,
+    opacities: torch.Tensor,
+    sdf_coeffs: torch.Tensor,
+    alpha_thresh: float = 0.01,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    final_mask = (scales > alpha_thresh).all(dim=1)
+
+    return means[final_mask], quats[final_mask], scales[final_mask], opacities[final_mask], sdf_coeffs[final_mask]
+
+
 def gaussian_to_ellipse(
     means: Tensor,
     quats: Tensor,
     scales: Tensor,
+    opacities: Tensor,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
 
-    covs, _ = _quat_scale_to_covar_preci(quats, scales) 
-    U, S, Vh = torch.linalg.svd(covs)
+    # covs, _ = _quat_scale_to_covar_preci(quats, scales) 
+    # U, S, Vh = torch.linalg.svd(covs)
 
-    S_reduced = S[:, :2]  # Select the two largest eigenvalues [N, 2]
-    U_reduced = U[:, :, :2] 
+    # S_reduced = S[:, :2]  # Select the two largest eigenvalues [N, 2]
+    # U_reduced = U[:, :, :2] 
 
-    r_a = torch.sqrt(S_reduced[:, 0])  
-    r_b = torch.sqrt(S_reduced[:, 1])
+    # r_a = torch.sqrt(S_reduced[:, 0])  
+    # r_b = torch.sqrt(S_reduced[:, 1])
 
-    axes_a = U_reduced[:, :, 0] / torch.norm(U_reduced[:, :, 0], dim=-1, keepdim=True)  
-    axes_b = U_reduced[:, :, 1] / torch.norm(U_reduced[:, :, 1], dim=-1, keepdim=True) 
+    # axes_a = U_reduced[:, :, 0] / torch.norm(U_reduced[:, :, 0], dim=-1, keepdim=True)  
+    # axes_b = U_reduced[:, :, 1] / torch.norm(U_reduced[:, :, 1], dim=-1, keepdim=True) 
     
-    return r_a, r_b, axes_a, axes_b
+    # return r_a, r_b, axes_a, axes_b
+
+    U = _quat_to_rotmat(quats) # shape: (N, 3, 3)
+    S = scales**2               # shape: (N, 3)
+
+    sorted_S, indices = torch.sort(S, dim=1, descending=True)
+    U_sorted = torch.gather(U, dim=2, index=indices.unsqueeze(1).expand(-1, 3, -1))
+
+    # opacities_np = opacities.detach().cpu().numpy()
+    # scale_factor_np = np.sqrt(chi2.ppf(0.99, df=3)) * opacities_np
+    # scale_factor = torch.tensor(scale_factor_np, device=opacities.device)
+    r_a = torch.sqrt(sorted_S[:, 0])# * scale_factor
+    r_b = torch.sqrt(sorted_S[:, 1])# * scale_factor 
+
+    axes_a = U_sorted[:, :, 0] / torch.norm(U_sorted[:, :, 0], dim=-1, keepdim=True)  
+    axes_b = U_sorted[:, :, 1] / torch.norm(U_sorted[:, :, 1], dim=-1, keepdim=True)
+   
+    n_vec = torch.cross(axes_a, axes_b, dim=-1)  # [N, 3]
+    n_vec = n_vec / torch.norm(n_vec, dim=-1, keepdim=True)  # Normalize the normal vector
+
+
+    return r_a, r_b, axes_a, axes_b, n_vec
+
 
 def cull_mask(
     ro: Tensor, # [3]
@@ -858,45 +928,383 @@ def cull_mask(
     # return (dist <= r_a) | (dist <= r_b)
     return in_front & ((dist <= r_a) | (dist <= r_b))
 
-def signed_distance(
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+def sdf_harmonics(
+    degree: int, 
+    dirs: torch.Tensor, 
+    coeffs: torch.Tensor
+):
+    dirs = F.normalize(dirs, p=2, dim=-1)
+    num_bases = (degree + 1) ** 2
+    bases = torch.zeros_like(coeffs)
+    bases[..., :num_bases] = _eval_sh_bases_fast(num_bases, dirs)
+    return (bases * coeffs).sum(dim=-1)
+
+def knn_candidates(
+    means, 
+    points, 
+    k=20
+):
+    means_np = means.detach().cpu().numpy()
+    points_np = points.detach().cpu().numpy()
+
+    tree = cKDTree(means_np)
+    dist, indices = tree.query(points_np, k=k)
+
+    return torch.tensor(dist, device=means.device, dtype=torch.float32), torch.tensor(indices, device=means.device, dtype=torch.long)
+
+def safe_norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
+    return torch.sqrt((x ** 2).sum(dim=dim).clamp_min(eps))
+
+def signed_distance_knn(
+    pos: torch.Tensor,    # [M, 3]
+    means: torch.Tensor,  # [N, 3]
+    r_a: torch.Tensor,    # [N]
+    r_b: torch.Tensor,    # [N]
+    axes_a: torch.Tensor, # [N, 3]
+    axes_b: torch.Tensor, # [N, 3],
+    sdf_coeffs: torch.Tensor, # [N, K]
+    sh_degree: int,
+    max_threshold: float = 0.1,  # optional threshold for filtering dist_min
+    eps = 1e-8
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    _, indices = knn_candidates(means, pos, k=10)  # [M, k]
+    means_knn   = means[indices]      # [M, k, 3]
+    r_a_knn     = r_a[indices]        # [M, k]
+    r_b_knn     = r_b[indices]        # [M, k]
+    axes_a_knn  = axes_a[indices]     # [M, k, 3]
+    axes_b_knn  = axes_b[indices]     # [M, k, 3]
+
+    diff = pos.unsqueeze(1) - means_knn  # [M, k, 3]
+
+    proj_a = torch.sum(diff * axes_a_knn, dim=-1)  # [M, k]
+    proj_b = torch.sum(diff * axes_b_knn, dim=-1)  # [M, k]
+    proj_point = proj_a.unsqueeze(-1) * axes_a_knn + proj_b.unsqueeze(-1) * axes_b_knn  # [M, k, 3]
+
+    scaled_a = proj_a / r_a_knn.clamp_min(eps)  # [M, k]
+    scaled_b = proj_b / r_b_knn.clamp_min(eps)  # [M, k]
+    scale_factor = torch.sqrt(scaled_a**2 + scaled_b**2 + eps)  # [M, k]
+
+    closest_a = proj_a / scale_factor.clamp_min(eps)  # [M, k]
+    closest_b = proj_b / scale_factor.clamp_min(eps)  # [M, k]
+    closest_point_boundary = (closest_a.unsqueeze(-1) * axes_a_knn +
+                              closest_b.unsqueeze(-1) * axes_b_knn)  # [M, k, 3]
+    
+    # dist_proj = torch.norm(diff - proj_point, dim=-1).clamp_min(eps)            # [M, k]
+    # dist_boundary = torch.norm(diff - closest_point_boundary, dim=-1).clamp_min(eps)  # [M, k]
+    dist_proj = safe_norm(diff - proj_point, dim=-1, eps=eps)
+    dist_boundary = safe_norm(diff - closest_point_boundary, dim=-1, eps=eps) 
+
+    inside_mask = (scaled_a**2 + scaled_b**2) <= 1  # [M, k]
+    dist = torch.where(inside_mask, dist_proj, dist_boundary)  # [M, k]
+
+    _, idx = torch.min(dist, dim=1)  # idx: [M]
+    orig_idx = indices[torch.arange(indices.shape[0]), idx]  # [M]
+
+    selected_coeffs = sdf_coeffs[orig_idx]  # [M, K]
+
+    selected_means = means_knn[torch.arange(means_knn.shape[0]), idx]  # [M, 3]
+    
+    dirs = selected_means - pos  # [M, 3]
+    depth_harmonics = sdf_harmonics(sh_degree, dirs, selected_coeffs)  # [M]
+    
+    sdf_base = dist[torch.arange(dist.shape[0]), idx]  # [M]
+    dist_min = sdf_base + depth_harmonics
+    if max_threshold is not None:
+        mask_filter = dist_min <= max_threshold
+        dist_min = dist_min[mask_filter]
+        orig_idx = orig_idx[mask_filter]
+
+
+    return dist_min, orig_idx
+
+def update_id_to_count(id_to_count, gaussian_ids, orig_idx):
+    gaussian_ids_list = sorted(list(gaussian_ids))
+
+    # Then convert the list to a tensor.
+    gaussian_ids_tensor = torch.tensor(gaussian_ids_list, dtype=torch.long, device=orig_idx.device)
+
+
+    orig_idx = orig_idx.view(-1).long()  
+    if orig_idx.numel() == 0:
+        return id_to_count 
+    
+    if orig_idx.max() >= gaussian_ids_tensor.size(0):
+        print(f"orig_idx: {orig_idx.max()}, gaussian_ids: {gaussian_ids_tensor.size(0)}")
+        raise ValueError("orig_idx contains an index out of bounds for gaussian_ids")
+    
+    closest_ids = gaussian_ids_tensor[orig_idx]  
+    unique_ids, counts = torch.unique(closest_ids, return_counts=True)
+    
+    for uid, cnt in zip(unique_ids.tolist(), counts.tolist()):
+        id_to_count[uid] = id_to_count.get(uid, 0) + cnt
+    
+    return id_to_count
+
+
+
+from typing import Callable
+
+def hessian_loss(
     pos: Tensor,
     means: Tensor,
-    r_a: Tensor,
-    r_b: Tensor,
-    axes_a: Tensor,
-    axes_b: Tensor,
+    normals: Tensor,
+    sdf_fn: Callable[[Tensor], Tensor],
+    # sdf_weight: float = 1e-2,
+    # hessian_weight: float = 1e-8,
+    eps: float = 1e-8
 ) -> Tuple[Tensor, Tensor]:
-    
-    diff = pos - means
+    """
+    Combined Hessian and L1 SDF loss.
+    """
+    pos = pos.clone().detach().requires_grad_(True)
 
-    proj_a = torch.sum(diff * axes_a, dim=-1)
-    proj_b = torch.sum(diff * axes_b, dim=-1)
+    # Evaluate SDF values
+    sdf, idx = sdf_fn(pos)  # [M]
+
+    #First-order gradients
+    # grad_sdf = torch.autograd.grad(
+    #     outputs=sdf,
+    #     inputs=pos,
+    #     grad_outputs=torch.ones_like(sdf),
+    #     create_graph=True,
+    #     retain_graph=True,
+    #     only_inputs=True
+    # )[0]  # [M, 3]
+
+    # # Second-order (Hessian)
+    # hessians = []
+    # for i in range(grad_sdf.shape[-1]):
+    #     grad2 = torch.autograd.grad(
+    #         outputs=grad_sdf[:, i],
+    #         inputs=pos,
+    #         grad_outputs=torch.ones_like(grad_sdf[:, i]),
+    #         create_graph=True,
+    #         retain_graph=True,
+    #         only_inputs=True
+    #     )[0]
+    #     hessians.append(grad2)
+
+    # hessian = torch.stack(hessians, dim=2)  # [M, 3, 3]
+    # hessian_squared_norm = (hessian ** 2).sum(dim=(1, 2)).clamp_min(eps)  # [M]
+
+    # hessian_loss = hessian_squared_norm.mean()
+    sdf_loss = torch.abs(sdf).mean()  # same as F.l1_loss(sdf, 0)
+
+    # Gather the normal for each point based on idx
+    n_i = normals[idx]       # shape: [M, 3]
+    mu_i = means[idx]        # shape: [M, 3]
+    
+    # eps = torch.sum((pos - mu_i) * mu_i, dim=-1) 
+    
+    sdf_sum = sdf.sum()  
+    grad = torch.autograd.grad(
+        outputs=sdf_sum,
+        inputs=pos,
+        create_graph=True,
+        retain_graph=True
+    )[0]  # grad: [M, 3]
+    
+    grad_norm = grad.norm(dim=-1, keepdim=True) + 1e-8  # [M, 1]
+    cos_term = torch.sum(grad * n_i, dim=-1, keepdim=True) / grad_norm  # [M, 1]
+
+    # L^v_cons: encourage the SDF gradient to be aligned with the surfel normal.
+    v_cons = torch.mean(1.0 - cos_term)
+
+
+    # # ---- Distance Consistency Term ----
+    # # offset e_i = dot( (p_i - mu_i), n_i )
+    # #   p_i = pos[i],  mu_i = means[idx[i]],  n_i = normals[idx[i]]
+    # offset_i = (pos - mu_i) * n_i
+    # offset_i = offset_i.sum(dim=-1)  # shape: [M]
+
+    # # L^d_cons = mean( |SDF - offset_i| )
+    # dist_cons = (sdf - offset_i).abs().mean()
+
+    # # ---- Normal Consistency Term ----
+    # # We want 1 - cos(grad_sdf, n_i) = 1 - (grad_sdf·n_i / ||grad_sdf||)
+    # # Make sure the SDF gradient is normalized before the dot product
+    # grad_norm = grad_sdf.norm(dim=-1, keepdim=True).clamp_min(eps)
+    # grad_sdf_unit = grad_sdf / grad_norm
+
+    # # Dot product with normal n_i (assuming n_i is already normalized)
+    # dot_vals = (grad_sdf_unit * n_i).sum(dim=-1)  # shape: [M]
+    # normal_cons = (1.0 - dot_vals).mean()
+
+    return sdf_loss, v_cons, idx
+
+def surface_consistency_loss(
+    pos: torch.Tensor,         # [M, 3]: 
+    means: torch.Tensor,         # [N, 3]:
+    global_normals: torch.Tensor,     # [N, 3]: 
+    sdf_fn: Callable[[torch.Tensor], torch.Tensor],  
+    #gaussian_ids: torch.Tensor,  # [M]:
+    eps_max: float = 0.001,
+    retain_graph: bool = True 
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    
+    device = pos.device
+
+    
+    pos = pos.clone().detach().requires_grad_(True) 
+    
+    sdf, idx = sdf_fn(pos)  # sdf_vals: [M]
+    L_sdf = (torch.abs(sdf)).mean()
+
+    # closest_ids = gaussian_ids[idx]  # [M]
+    # gidx, counts = torch.unique(closest_ids, return_counts=True)
+
+    # selected_means = means[gidx]  # shape: [M, 3]
+    # selected_normals = global_normals[gidx]  # shape: [M, 3]
+
+
+    # M = selected_means.shape[0]
+
+    # epsilons = torch.empty(M, device=device).uniform_(-eps_max, eps_max)  # [M]
+    
+    # query_points = selected_means + epsilons.unsqueeze(-1) * selected_normals  # [M, 3]
+    # query_points = query_points.clone().detach().requires_grad_(True)  # [M, 3]
+
+    # sdf_vals, _ = sdf_fn(query_points)  # [M]
+    
+    # sdf_sum = sdf_vals.sum()  # scalar to accumulate contributions
+    # grads = torch.autograd.grad(
+    #     outputs=sdf_sum,
+    #     inputs=query_points,
+    #     create_graph=True,
+    #     retain_graph=retain_graph
+    # )[0]  # grads: [M, 3]
+
+    # L_d = (torch.abs(sdf_vals - epsilons)).mean()  # L^d_cons
+
+    # grad_norm = torch.norm(grads, dim=-1, keepdim=True) + 1e-12
+    # cos_sim = torch.sum(grads * selected_normals, dim=-1, keepdim=True) / grad_norm
+    # L_v = torch.mean(1.0 - cos_sim)
+
+    L_d = torch.zeros_like(L_sdf, device=device)
+    L_v = torch.zeros_like(L_sdf, device=device)
+    
+    
+    return L_sdf, L_d, L_v, sdf, idx
+
+# def surface_consistency_loss(
+#     pos: torch.Tensor,         # [M, 3]: 
+#     global_normals: torch.Tensor,     # [M, 3]: 
+#     sdf_fn: Callable[[torch.Tensor], torch.Tensor],  
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    
+#     pos_diff = pos.clone().detach().requires_grad_(True)
+    
+#     sdf_val, idx = sdf_fn(pos)
+#     normals = global_normals[idx]  # shape: [M, 3]
+
+#     loss_sdf = torch.mean(torch.abs(sdf_val))
+
+#     sdf_sum = sdf_val.sum()  # Scalar summary to backpropagate per point.
+#     grads = torch.autograd.grad(
+#         outputs=sdf_sum,
+#         inputs=pos_diff,
+#         create_graph=True,
+#         retain_graph=True,
+#     )[0]  # grads: [M, 3]
+#     #loss_eik = torch.mean((grads.norm(dim=-1) - 1) ** 2)
+
+#     grad_norm = torch.norm(grads, dim=-1, keepdim=True) + 1e-12
+#     # Compute cosine similarity between the gradient and provided normals.
+#     cos_sim = torch.sum(grads * normals, dim=-1, keepdim=True) / grad_norm
+#     loss_align = torch.mean(1.0 - cos_sim)
+
+#     return loss_sdf, loss_align, idx
+
+def eikonal_loss(
+    pos: torch.Tensor,
+    sdf: torch.Tensor,
+) -> torch.Tensor:
+    # Compute the gradient of the SDF with respect to points.
+    grad_sdf = torch.autograd.grad(
+        outputs=sdf,
+        inputs=pos,
+        grad_outputs=torch.ones_like(sdf),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]  # shape: [M, 3]
+    
+    # Enforce that the gradient norm is close to 1.
+    loss = ((grad_sdf.norm(dim=-1) - 1) ** 2).mean()
+    return loss
+
+def laplacian_loss(pos, sdf):
+    # Compute first derivatives
+    grad_sdf = torch.autograd.grad(
+        outputs=sdf,
+        inputs=pos,
+        grad_outputs=torch.ones_like(sdf),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]  # [M, 3]
+    
+    laplacian = 0.0
+    # Sum the second derivatives along the diagonal to compute the Laplacian.
+    for i in range(pos.shape[-1]):
+        grad2 = torch.autograd.grad(
+            outputs=grad_sdf[:, i],
+            inputs=pos,
+            grad_outputs=torch.ones_like(grad_sdf[:, i]),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0][:, i]  # [M]
+        laplacian += grad2
+    
+    loss = (laplacian ** 2).mean()
+    return loss
+
+
+def signed_distance(
+    pos: torch.Tensor,    # [M, 3]
+    means: torch.Tensor,  # [N, 3]
+    r_a: torch.Tensor,    # [N]
+    r_b: torch.Tensor,    # [N]
+    axes_a: torch.Tensor, # [N, 3]
+    axes_b: torch.Tensor, # [N, 3]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    diff = pos[:, None, :] - means[None, :, :]
+
+    proj_a = torch.sum(diff * axes_a[None, :, :], dim=-1)  # [M,N]
+    proj_b = torch.sum(diff * axes_b[None, :, :], dim=-1)  # [M,N]
     
     proj_point = (
-        proj_a.unsqueeze(-1) * axes_a +
-        proj_b.unsqueeze(-1) * axes_b 
-    )
+        proj_a.unsqueeze(-1) * axes_a[None, :, :] +
+        proj_b.unsqueeze(-1) * axes_b[None, :, :]
+    )  # [M,N,3]
     
-    scaled_a = proj_a / r_a
-    scaled_b = proj_b / r_b
+    scaled_a = proj_a / (r_a[None, :])  # [M,N]
+    scaled_b = proj_b / (r_b[None, :])  # [M,N]
     
-    scale_factor = torch.sqrt(scaled_a**2 + scaled_b**2)
+    scale_factor = torch.sqrt(scaled_a**2 + scaled_b**2 + 1e-8)  # [M,N]
     
-    closest_a = proj_a / scale_factor
-    closest_b = proj_b / scale_factor
+    closest_a = proj_a / (scale_factor)  # [M,N]
+    closest_b = proj_b / (scale_factor) # [M,N]
     closest_point_boundary = (
-        closest_a.unsqueeze(-1) * axes_a +
-        closest_b.unsqueeze(-1) * axes_b
-    )
+        closest_a.unsqueeze(-1) * axes_a[None, :, :] +
+        closest_b.unsqueeze(-1) * axes_b[None, :, :]
+    )  # [M,N,3]
     
-    dist_proj = torch.norm(diff - proj_point, dim=-1)
-    dist_boundary = torch.norm(diff - closest_point_boundary, dim=-1)
+    dist_proj = torch.norm(diff - proj_point, dim=-1)  # [M,N]
+    dist_boundary = torch.norm(diff - closest_point_boundary, dim=-1)  # [M,N]
 
-    inside_mask = (scaled_a**2 + scaled_b**2) <= 1
+    inside_mask = (scaled_a**2 + scaled_b**2) <= 1  # [M,N]
 
-    dist = torch.where(inside_mask, dist_proj, dist_boundary)
-
-    dist_min, dist_indices = torch.min(dist, dim=0)
+    dist = torch.where(inside_mask, dist_proj, dist_boundary)  # [M,N]
+    
+    dist_min, dist_indices = torch.min(dist, dim=1)  # dist_min: [M], dist_indices: [M]
 
     return dist_min, dist_indices
 
@@ -920,6 +1328,7 @@ def sphere_trace(
     hit_color = torch.zeros((H, W, 3), device=means.device)
 
     r_a, r_b, axes_a, axes_b = gaussian_to_ellipse(means, quats, scales)
+
 
     for i in range(H):
         for j in range(W):
@@ -1004,4 +1413,66 @@ def generate_depth_image(
     return depth_norm.unsqueeze(-1).expand(-1, -1, 3) 
 
 
+from sklearn.neighbors import KDTree
+import numpy as np
+
+@torch.no_grad()
+def outer_ellipsoid(
+    points: Tensor,
+    rgbs: Tensor = None,
+    sample_size: int = None,
+    tol: float = 0.001,
+    max_iter: int = 5000,
+    k: int = 5,
+    max_dist: float = 0.01,
+    device = "cuda",
+) -> Tuple[Tensor, Tensor, Tensor]:
     
+    points_np = points.cpu().numpy()
+    tree = KDTree(points_np)
+    if sample_size is not None:
+        sample = np.random.choice(points_np.shape[0], size=sample_size, replace=False)
+        sampled_points = points_np[sample]
+        dist, idx = tree.query(sampled_points, k=k)
+    else:
+        dist, idx = tree.query(points_np, k=k)
+
+    valid_neighbors = np.all(dist <= max_dist, axis=1)
+    valid_idx = idx[valid_neighbors]
+
+    clusters = torch.tensor(points_np[valid_idx], dtype=torch.float64, device=device)
+    
+    B, N, d = clusters.shape
+    Q = torch.cat((clusters, torch.ones((B, N, 1), dtype=torch.float64, device=device)), dim=2).permute(0, 2, 1)
+    u = torch.ones((B, N), dtype=torch.float64, device=device) / N  # [B, N]
+    err = torch.ones(B, dtype=torch.float64, device=device) * (1 + tol)
+    active_mask = err > tol  
+
+    for i in range(max_iter):
+        if not torch.any(active_mask):
+            break
+
+        X = Q[active_mask] @ torch.diag_embed(u[active_mask]) @ Q[active_mask].transpose(1, 2)  # [B_active, 4, 4]
+        X_inv = torch.linalg.inv(X)  # [B_active, 4, 4]
+        M = torch.diagonal(Q[active_mask].transpose(1, 2) @ X_inv @ Q[active_mask], dim1=1, dim2=2)  # [B_active, N]
+        jdx = torch.argmax(M, dim=1)  # [B_active,]
+        step_size = (M[torch.arange(M.shape[0]), jdx] - d - 1.0) / ((d + 1) * (M[torch.arange(M.shape[0]), jdx] - 1.0))  # [B_active,]
+        new_u_active = (1 - step_size.unsqueeze(1)) * u[active_mask]  # [B_active, N]
+        new_u_active.scatter_add_(1, jdx.unsqueeze(1), step_size.unsqueeze(1)) 
+        err_active = torch.linalg.norm(new_u_active - u[active_mask], dim=1)  # [B_active,]
+            
+        u[active_mask] = new_u_active
+        err[active_mask] = err_active
+        active_mask = err > tol
+
+    c = torch.einsum('bn,bnd->bd', u, clusters)  # [B, 3]
+    intermediate = torch.einsum('bnd,bn,bnm->bdm', clusters, u, clusters)  # [B, 3, 3]
+    A = torch.linalg.inv(intermediate - torch.einsum('bd,bm->bdm', c, c)) / d  # [B, 3, 3]
+
+    if rgbs is not None:
+        print("\n Ellipsoids generated \n")
+        rgbs_np = rgbs.cpu().numpy()
+        rgbs_np = rgbs_np[valid_neighbors]
+        return A, c, torch.from_numpy(rgbs_np)
+    else:
+        return A, c, None
