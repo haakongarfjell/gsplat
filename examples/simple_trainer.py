@@ -54,6 +54,7 @@ from gsplat.cuda._torch_impl import (
     outer_ellipsoid,
     surface_consistency_loss,
     normals_to_quats,
+    unproject_depths,
 )
 from gsplat.cuda._wrapper import(
     sphere_trace
@@ -184,15 +185,18 @@ class Config:
     
     sdf_pruning: bool = False
 
-    sdf_lambda: float = 1e-2
+    sdf_lambda: float = 1.0
 
     hessian_lambda: float = 1e-8
 
     alpha_threshold: float = 0.0
 
-    eikonal_lambda: float = 1e-4 * 2
+    sdf_lr_scale: float = 0.1
+
+    eikonal_lambda: float = 1e-2 * 2
     # Weight for depth loss
-    depth_lambda: float = 1e-4 * 2
+    depth_lambda: float = 1e-2 * 2
+
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -241,7 +245,7 @@ def create_splats_with_optimizers(
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
-        #normals = torch.from_numpy(parser.normals).float()
+        normals = torch.from_numpy(parser.normals).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
@@ -253,11 +257,11 @@ def create_splats_with_optimizers(
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
-    #tangent_scale = torch.log(dist_avg * init_scale)  # shape: (N,)
+    tangent_scale = torch.log(dist_avg * init_scale)  # shape: (N,)
     # Set a small constant for the normal's scale.
-    #normal_scale = tangent_scale * 1e-3  # shape: (N,)
+    normal_scale = tangent_scale * 1e-3  # shape: (N,)
 
-    #scales = torch.stack([tangent_scale, tangent_scale, normal_scale], dim=1)
+    scales = torch.stack([tangent_scale, tangent_scale, normal_scale], dim=1)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # U, S, Vh = torch.linalg.svd(covars)
@@ -272,8 +276,8 @@ def create_splats_with_optimizers(
     # scales = scales[world_rank::world_size]
 
     N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    #quats = normals_to_quats(normals)  # [N, 4]
+    #quats = torch.rand((N, 4))  # [N, 4]
+    quats = normals_to_quats(normals)  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
     params = [
@@ -316,15 +320,28 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+    # optimizers = {
+    #     name: optimizer_class(
+    #         [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+    #         eps=1e-15 / math.sqrt(BS),
+    #         # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+    #         betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+    #     )
+    #     for name, _, lr in params
+    # }
+
     optimizers = {
-        name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-        )
-        for name, _, lr in params
-    }
+    name: optimizer_class(
+        [{
+            "params": splats[name],
+            "lr": lr * math.sqrt(BS) * (cfg.sdf_lr_scale if name.startswith("sdf") else 1.0),
+            "name": name
+        }],
+        eps=1e-15 / math.sqrt(BS),
+        betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+    )
+    for name, _, lr in params
+}
     return splats, optimizers
 
 import open3d as o3d
@@ -658,11 +675,17 @@ class Runner:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
-            if cfg.sdf_loss:
+            if cfg.sdf_loss:# and (step > 4999 and step < 7000):
                 points_world = data["points_world"].to(device)  # [1, M, 3]
                 points_world = points_world.squeeze(0)
+                points_all = data["points_all"]
+
+                normals_world = data["normals_world"].to(device)  # [1, M, 3]
+                normals_world = normals_world.squeeze(0)
 
                 points_sample = points_world.clone().detach().requires_grad_(True)#[torch.randperm(points_world.shape[0])[:5000]]
+                normals_sample = normals_world.clone().detach().requires_grad_(True)#[torch.randperm(points_world.shape[0])[:5000]]
+
                 means = self.splats["means"]  # [N, 3]
                 quats = self.splats["quats"]
                 scales = torch.exp(self.splats["scales"])
@@ -705,7 +728,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode="RGB+ED", # if cfg.depth_loss else "RGB",
                 masks=masks,
             )
 
@@ -736,15 +759,24 @@ class Runner:
             )
 
             # loss
+
+            # if not (6499 < step < 7000 or 24999 < step < 30000):
+
             l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            # else:
+            #     l1loss = F.l1_loss(colors, pixels) * 1e-10
+            #     ssimloss = 1.0 - fused_ssim(
+            #         colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+            #     ) * 1e-10
+            #     loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
-            # if gt_alpha is not None:
-            #     alpha_loss = F.l1_loss(alphas, gt_alpha)
-            #     loss += alpha_loss
+            if gt_alpha is not None:
+                alpha_loss = F.l1_loss(alphas, gt_alpha.unsqueeze(-1))
+                loss += alpha_loss
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -764,23 +796,33 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss #* cfg.depth_lambda
+                
 
-            if cfg.sdf_loss:
-                # sdf, _ = signed_distance_knn(
-                #     pos=points_sample, 
-                #     means=means, 
-                #     r_a=r_a, 
-                #     r_b=r_b, 
-                #     axes_a=axes_a, 
-                #     axes_b=axes_b, 
+                # means, quats, scales, opacities, sdf_coeffs = filter_scales(
+                #     means=means,
+                #     quats=quats,
+                #     scales=scales,
+                #     opacities=opacities,
                 #     sdf_coeffs=sdf_coeffs,
-                #     sh_degree=0,
+                #     alpha_thresh=cfg.alpha_threshold,
                 # )
-                # sdfloss = F.l1_loss(sdf, torch.zeros_like(sdf))
-                # eikonalloss = eikonal_loss(
-                #     pos=points_sample,
-                #     sdf=sdf
-                # )
+
+                r_a, r_b, axes_a, axes_b, normals = gaussian_to_ellipse(means, quats, scales, opacities)
+
+                # if torch.isnan(means).any():
+                #     n_nans = torch.isnan(means).sum().item()
+                #     print(f"Nan elements {n_nans}")
+
+            if cfg.sdf_loss:# and (step > 4999 and step < 7000):
+
+                # depth_input = depths.squeeze(0).squeeze(-1)
+                # mask_input = masks.squeeze(0)
+                
+                # w2c_input = torch.linalg.inv(camtoworlds.squeeze(0))
+                # K_input = Ks.squeeze(0)
+
+                # depth_render_points = unproject_depths(depth_input, mask_input, w2c_input, K_input)
+                # print(depth_render_points.shape)
 
                 def sdf_fn(pos_sample: torch.Tensor) -> torch.Tensor:
                     sdf_values, idx = signed_distance_knn(
@@ -792,43 +834,35 @@ class Runner:
                         axes_b=axes_b,
                         sdf_coeffs=sdf_coeffs,
                         sh_degree=sh_degree_to_use,
-                        max_threshold=None
                     )
                     return sdf_values, idx
 
-                # # Use this to compute Hessian loss
-                # sdfloss, idx = hessian_loss(
-                #     means=means,
-                #     normals=normals,
-                #     pos=points_sample,
-                #     sdf_fn=sdf_fn
-                # )
-
-                sdfloss, L_d, L_v, sdf_vals, idx = surface_consistency_loss(
+                sdfloss, L_d, L_v, L_hess, sdf_vals, idx = surface_consistency_loss(
                     pos=points_sample,
                     means=means,
-                    global_normals=normals,
+                    global_normals=normals_sample,
                     sdf_fn=sdf_fn,
                 )
 
-                max_sdf = torch.max(sdf_vals)
 
-                loss += sdfloss * cfg.sdf_lambda #+ L_d * cfg.eikonal_lambda + L_v * cfg.eikonal_lambda
-                gaussian_ids_all = set(range(self.splats["means"].shape[0]))
+
+                if (6499 < step < 7000 or 29499 < step < 30000):
+                    loss += sdfloss * cfg.sdf_lambda + L_d * cfg.eikonal_lambda + L_v * cfg.eikonal_lambda #+ L_hess * cfg.hessian_lambda
+                    gaussian_ids_all = set(range(self.splats["means"].shape[0]))
+                    
+                    self.id_to_count = update_id_to_count(self.id_to_count, gaussian_ids_all, idx)
+                else:
+                    loss += sdfloss * cfg.sdf_lambda + L_d * cfg.eikonal_lambda + L_v * cfg.eikonal_lambda 
+
+            if step == 6999:
+                id_to_count_path = f"{self.stats_dir}/id_to_count_6999.pt"
+                torch.save(self.id_to_count, id_to_count_path)
+                self.id_to_count = {}
+            if step == 29999:
+                id_to_count_path = f"{self.stats_dir}/id_to_count_29999.pt"
+                torch.save(self.id_to_count, id_to_count_path)
+                self.id_to_count = {}
                 
-                self.id_to_count = update_id_to_count(self.id_to_count, gaussian_ids_all, idx)
-                #self.sdf_counter[idx] += 1
-                # self.sdf_gaussians.update(unique_idx)
-                # hessianloss = hessian_loss(
-                #     pos=points_sample,
-                #     sdf=sdf
-                # )
-                # loss += sdfloss * cfg.sdf_lambda  + eikonalloss * cfg.eikonal_lambda
-                # if torch.isnan(hessianloss):
-                # loss += sdfloss * cfg.sdf_lambda 
-                # else:
-                #loss += sdfloss * cfg.sdf_lambda #+ hessianloss * cfg.hessian_lambda #+ dist_cons * 0.0002 + normal_cons * 0.0002
-                #hessianloss = torch.zeros_like(sdfloss)
 
             # if step % 100 == 0:
             #     print(f"Step {step}: {len(self.sdf_gaussians)} unique SDF Gaussians")                
@@ -855,17 +889,20 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
-            if cfg.sdf_loss:
+            if cfg.sdf_loss: # and (step > 4999 and step < 7000):
                 desc += f"L_sdf={sdfloss.item():.6f}| "
                 # desc += f"eikonal loss={eikonalloss.item():.6f}| "
-                desc += f"max_sdf={max_sdf.item():.6f}| "
+                #desc += f"max_sdf={max_sdf.item():.6f}| "
                 desc += f"L_d={L_d.item():.6f}| "
                 desc += f"L_v={L_v.item():.6f}| "
+                #desc += f"L_hess={L_hess.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
+
+            
 
             # write images (gt and render)
             # if world_rank == 0 and step % 800 == 0:
@@ -885,7 +922,7 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
-                if cfg.sdf_loss:
+                if cfg.sdf_loss:# and (step > 4999 and step < 7000):
                     self.writer.add_scalar("train/sdfloss", sdfloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
@@ -927,18 +964,18 @@ class Runner:
 
 
                 # unique_indices = torch.tensor(list(self.sdf_gaussians), dtype=torch.long, device=means.device)
-                mesh_extractor = mesh_extract.MeshExtract(
-                    data_dir=cfg.data_dir,
-                    result_dir=cfg.result_dir,
-                    ckpt=f"ckpts/ckpt_{step}_rank{self.world_rank}.pt",
-                    gt_mesh_dir="results/meshes/monkey.ply",
-                    #unique_indices=unique_indices,
-                    sdf_loss=cfg.sdf_loss,
-                    alpha_threshold=cfg.alpha_threshold,
-                    step=step,
-                )
+                # mesh_extractor = mesh_extract.MeshExtract(
+                #     data_dir=cfg.data_dir,
+                #     result_dir=cfg.result_dir,
+                #     ckpt=f"ckpts/ckpt_{step}_rank{self.world_rank}.pt",
+                #     gt_mesh_dir="results/meshes/monkey.ply",
+                #     #unique_indices=unique_indices,
+                #     sdf_loss=cfg.sdf_loss,
+                #     alpha_threshold=cfg.alpha_threshold,
+                #     step=step,
+                # )
                 # mesh_extractor.extract_rasterization()
-                mesh_extractor.extract_marching_cubes()
+                #mesh_extractor.extract_marching_cubes()
                 #mesh_extractor.compute_chamfer_distance()
 
             if (
@@ -1005,29 +1042,31 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
-                    self.id_to_count,
-                    self.gaussian_ids_all,
-                    cfg.sdf_pruning,
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    lr=schedulers[0].get_last_lr()[0],
-                )
-            else:
-                assert_never(self.cfg.strategy)
+            if not (6499 < step < 7000 or 29499 < step < 30000) and cfg.sdf_loss:
+                if isinstance(self.cfg.strategy, DefaultStrategy):
+                    self.cfg.strategy.step_post_backward(
+                        points_all,
+                        self.id_to_count,
+                        self.gaussian_ids_all,
+                        cfg.sdf_pruning,
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        packed=cfg.packed,
+                    )
+                elif isinstance(self.cfg.strategy, MCMCStrategy):
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        lr=schedulers[0].get_last_lr()[0],
+                    )
+                else:
+                    assert_never(self.cfg.strategy)
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1096,6 +1135,11 @@ class Runner:
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
                     canvas,
                 )
+
+                masks = data["mask"].to(device) if "mask" in data else None
+                if masks is not None:
+                    pixels = pixels * masks[..., None]
+                    colors = colors * masks[..., None]
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
