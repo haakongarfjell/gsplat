@@ -968,7 +968,6 @@ def signed_distance_knn(
     axes_b: torch.Tensor, # [N, 3],
     sdf_coeffs: torch.Tensor, # [N, K]
     sh_degree: int,
-    max_threshold: float = 0.1,  # optional threshold for filtering dist_min
     eps = 1e-8
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     
@@ -994,8 +993,6 @@ def signed_distance_knn(
     closest_point_boundary = (closest_a.unsqueeze(-1) * axes_a_knn +
                               closest_b.unsqueeze(-1) * axes_b_knn)  # [M, k, 3]
     
-    # dist_proj = torch.norm(diff - proj_point, dim=-1).clamp_min(eps)            # [M, k]
-    # dist_boundary = torch.norm(diff - closest_point_boundary, dim=-1).clamp_min(eps)  # [M, k]
     dist_proj = safe_norm(diff - proj_point, dim=-1, eps=eps)
     dist_boundary = safe_norm(diff - closest_point_boundary, dim=-1, eps=eps) 
 
@@ -1014,11 +1011,6 @@ def signed_distance_knn(
     
     sdf_base = dist[torch.arange(dist.shape[0]), idx]  # [M]
     dist_min = sdf_base + depth_harmonics
-    if max_threshold is not None:
-        mask_filter = dist_min <= max_threshold
-        dist_min = dist_min[mask_filter]
-        orig_idx = orig_idx[mask_filter]
-
 
     return dist_min, orig_idx
 
@@ -1137,20 +1129,34 @@ def hessian_loss(
 
     return sdf_loss, v_cons, idx
 
+def compute_hessian_frobenius(f_vals, x):
+    # f_vals: [M] , x: [M,3], both require_grad=True
+    grads = torch.autograd.grad(f_vals.sum(), x, create_graph=True)[0]  # [M,3]
+    H = []
+    for i in range(3):
+        # ∂²f/∂xᵢ∂x
+        dgi = torch.autograd.grad(grads[:, i].sum(), x, create_graph=True)[0]  # [M,3]
+        H.append(dgi)
+    # stack along new dim → [3, M, 3], then permute → [M,3,3]
+    H = torch.stack(H, dim=0).permute(1,0,2)
+    # Frobenius norm² of each Hessian
+    return (H.pow(2).sum(dim=(-2,-1))).mean()  # scalar
+
 def surface_consistency_loss(
     pos: torch.Tensor,         # [M, 3]: 
     means: torch.Tensor,         # [N, 3]:
     global_normals: torch.Tensor,     # [N, 3]: 
     sdf_fn: Callable[[torch.Tensor], torch.Tensor],  
     #gaussian_ids: torch.Tensor,  # [M]:
-    eps_max: float = 0.001,
+    eps_max: float = 0.05,
     retain_graph: bool = True 
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     
     device = pos.device
 
     
-    pos = pos.clone().detach().requires_grad_(True) 
+    pos = pos.clone().detach().requires_grad_(True)
+
     
     sdf, idx = sdf_fn(pos)  # sdf_vals: [M]
     L_sdf = (torch.abs(sdf)).mean()
@@ -1162,63 +1168,94 @@ def surface_consistency_loss(
     # selected_normals = global_normals[gidx]  # shape: [M, 3]
 
 
-    # M = selected_means.shape[0]
+    M = global_normals.shape[0]
 
-    # epsilons = torch.empty(M, device=device).uniform_(-eps_max, eps_max)  # [M]
+    epsilons = torch.empty(M, device=device).uniform_(-eps_max, eps_max)  # [M]
     
-    # query_points = selected_means + epsilons.unsqueeze(-1) * selected_normals  # [M, 3]
-    # query_points = query_points.clone().detach().requires_grad_(True)  # [M, 3]
+    query_points = pos + epsilons.unsqueeze(-1) * global_normals  # [M, 3]
+    query_points = query_points.clone().detach().requires_grad_(True)  # [M, 3]
 
-    # sdf_vals, _ = sdf_fn(query_points)  # [M]
+    sdf_vals, _ = sdf_fn(query_points)  # [M]
     
-    # sdf_sum = sdf_vals.sum()  # scalar to accumulate contributions
-    # grads = torch.autograd.grad(
-    #     outputs=sdf_sum,
-    #     inputs=query_points,
-    #     create_graph=True,
-    #     retain_graph=retain_graph
-    # )[0]  # grads: [M, 3]
+    sdf_sum = sdf_vals.sum()  # scalar to accumulate contributions
+    grads = torch.autograd.grad(
+        outputs=sdf_sum,
+        inputs=query_points,
+        create_graph=True,
+        retain_graph=retain_graph
+    )[0]  # grads: [M, 3]
 
-    # L_d = (torch.abs(sdf_vals - epsilons)).mean()  # L^d_cons
+    L_d = (torch.abs(sdf_vals - epsilons)).mean()  # L^d_cons
 
-    # grad_norm = torch.norm(grads, dim=-1, keepdim=True) + 1e-12
-    # cos_sim = torch.sum(grads * selected_normals, dim=-1, keepdim=True) / grad_norm
-    # L_v = torch.mean(1.0 - cos_sim)
+    grad_norm = torch.norm(grads, dim=-1, keepdim=True) + 1e-12
+    cos_sim = torch.sum(grads * global_normals, dim=-1, keepdim=True) / grad_norm
+    L_v = torch.mean(1.0 - cos_sim)    
 
-    L_d = torch.zeros_like(L_sdf, device=device)
-    L_v = torch.zeros_like(L_sdf, device=device)
-    
-    
-    return L_sdf, L_d, L_v, sdf, idx
+    L_hess = torch.zeros_like(L_sdf, device=device)
 
-# def surface_consistency_loss(
-#     pos: torch.Tensor,         # [M, 3]: 
-#     global_normals: torch.Tensor,     # [M, 3]: 
-#     sdf_fn: Callable[[torch.Tensor], torch.Tensor],  
-# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    
-#     pos_diff = pos.clone().detach().requires_grad_(True)
-    
-#     sdf_val, idx = sdf_fn(pos)
-#     normals = global_normals[idx]  # shape: [M, 3]
+    return L_sdf, L_d, L_v, L_hess, sdf, idx
 
-#     loss_sdf = torch.mean(torch.abs(sdf_val))
+def unproject_depths(depth, mask, w2c, K):
+    # grab device/dtype from depth
+    device = depth.device
+    dtype  = depth.dtype
 
-#     sdf_sum = sdf_val.sum()  # Scalar summary to backpropagate per point.
-#     grads = torch.autograd.grad(
-#         outputs=sdf_sum,
-#         inputs=pos_diff,
-#         create_graph=True,
-#         retain_graph=True,
-#     )[0]  # grads: [M, 3]
-#     #loss_eik = torch.mean((grads.norm(dim=-1) - 1) ** 2)
+    depth = depth.unsqueeze(0).unsqueeze(0)
+    # 2) interpolate by factor 0.25 in each spatial dim
+    depth = F.interpolate(
+        depth,
+        scale_factor=(0.25, 0.25),
+        mode='nearest',
+        recompute_scale_factor=True
+    )
+    # 3) remove the extra dims → (H', W')
+    depth = depth.squeeze(0).squeeze(0)
+    print(depth.shape)
 
-#     grad_norm = torch.norm(grads, dim=-1, keepdim=True) + 1e-12
-#     # Compute cosine similarity between the gradient and provided normals.
-#     cos_sim = torch.sum(grads * normals, dim=-1, keepdim=True) / grad_norm
-#     loss_align = torch.mean(1.0 - cos_sim)
+    mask = mask.to(device)
+    w2c  = w2c.to(device)
+    K    = K.to(device)
 
-#     return loss_sdf, loss_align, idx
+    depth_h, depth_w = depth.shape  # (128, 160)
+    image_w, image_h = mask.shape   # (640, 512)
+
+    scale_x = image_w / depth_w  # 4
+    scale_y = image_h / depth_h  # 4
+
+    v_depth, u_depth = torch.meshgrid(
+        torch.arange(depth_h, device=device, dtype=dtype),
+        torch.arange(depth_w, device=device, dtype=dtype),
+        indexing='ij'
+    )
+
+    u_img = u_depth * scale_x
+    v_img = v_depth * scale_y
+
+    u_flat  = u_img.flatten()
+    v_flat  = v_img.flatten()
+    z_flat  = depth.flatten()
+
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
+
+    X = (u_flat - cx) * z_flat / fx
+    Y = (v_flat - cy) * z_flat / fy
+    Z = z_flat
+    pts_cam = torch.stack([X, Y, Z], dim=-1)   # (N,3)
+
+    ones = torch.ones((pts_cam.shape[0], 1), device=device, dtype=dtype)
+    pts_cam_h = torch.cat([pts_cam, ones], dim=-1)   # (N,4)
+
+    w2c_inv = torch.linalg.inv(w2c)
+    pts_w_h = (w2c_inv @ pts_cam_h.T).T            # (N,4)
+    pts_w   = pts_w_h[:, :3] / pts_w_h[:, 3:4]     # (N,3)
+
+    u_idx = torch.round(u_flat).long().clamp(0, image_w - 1)
+    v_idx = torch.round(v_flat).long().clamp(0, image_h - 1)
+
+    # 12) boolean mask pick
+    keep = mask[v_idx, u_idx]                     # still torch.bool
+    return pts_w[keep]
 
 def eikonal_loss(
     pos: torch.Tensor,

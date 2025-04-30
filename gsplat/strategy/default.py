@@ -7,7 +7,9 @@ from .base import Strategy
 from .ops import duplicate, remove, reset_opa, split
 from typing_extensions import Literal
 
-
+from gsplat.cuda._torch_impl import (
+    knn_candidates
+)
 @dataclass
 class DefaultStrategy(Strategy):
     """A default strategy that follows the original 3DGS paper:
@@ -151,6 +153,7 @@ class DefaultStrategy(Strategy):
 
     def step_post_backward(
         self,
+        points_all,
         id_to_count,
         gaussian_ids_all,
         sdf_pruning,
@@ -174,6 +177,7 @@ class DefaultStrategy(Strategy):
         ):
             # prune GSs
             n_prune = self._prune_gs(
+                points_all,
                 id_to_count,
                 gaussian_ids_all,
                 sdf_pruning,
@@ -331,6 +335,7 @@ class DefaultStrategy(Strategy):
     @torch.no_grad()
     def _prune_gs(
         self,
+        points_all,
         id_to_count,
         gaussian_ids_all,
         sdf_pruning,
@@ -357,16 +362,27 @@ class DefaultStrategy(Strategy):
             is_prune = is_prune | is_too_big
 
         if sdf_pruning:
-            #print min and max id_to_count value
+            means = params["means"]
 
-            lowest_ids = [gid for gid, cnt in id_to_count.items() if cnt < 2]
-            if lowest_ids:
-                lowest_ids_tensor = torch.tensor(lowest_ids, dtype=torch.long, device=is_prune.device)
-                is_prune[lowest_ids_tensor] = True
+            dists, idx = knn_candidates(points_all.squeeze(0), means, k=1)
+            
+            far_mask = dists > 0.1
 
-            pruned_ids = torch.nonzero(is_prune).flatten().tolist()
-            for gid in pruned_ids:
-                gaussian_ids_all.discard(gid)
+            is_prune[far_mask] = True
+
+
+
+        # if sdf_pruning:
+        #     #print min and max id_to_count value
+
+        #     lowest_ids = [gid for gid, cnt in id_to_count.items() if cnt < 2]
+        #     if lowest_ids:
+        #         lowest_ids_tensor = torch.tensor(lowest_ids, dtype=torch.long, device=is_prune.device)
+        #         is_prune[lowest_ids_tensor] = True
+
+        #     pruned_ids = torch.nonzero(is_prune).flatten().tolist()
+        #     for gid in pruned_ids:
+        #         gaussian_ids_all.discard(gid)
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
