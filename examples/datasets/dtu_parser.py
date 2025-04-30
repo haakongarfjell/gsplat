@@ -87,7 +87,7 @@ def read_cam(filepath):
     
     return extrinsic, intrinsic, extra_params
 
-def unproject_depths(depth, image, w2c, K, near_fars):
+def unproject_depths(depth, image, mask, w2c, K, near_fars):
     
     depth_h, depth_w = depth.shape  # (128, 160)
     # Image resolution:
@@ -138,6 +138,13 @@ def unproject_depths(depth, image, w2c, K, near_fars):
     # It is important to check that the indices are in range.
     # (In theory they are, if the downsampling/cropping is aligned.)
     colors = image[v_indices, u_indices, :]  # image is indexed as [row, col]
+    colors = image[  v_indices, u_indices, : ]   # (N,3) or (N,4)
+    mask_vals = mask[ v_indices, u_indices ]    # (N,)
+
+    # keep only those points where mask > 0
+    keep = mask_vals > 0
+    points_world = points_world[keep]
+    colors       = colors[keep]
 
     return points_world, colors
 
@@ -196,11 +203,19 @@ class Parser:
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
-        
-        depths_dir = os.path.join(data_dir, "Depths/scan24_train")
+        scan_name   = os.path.basename(os.path.normpath(data_dir))  
+        # scan_name == "scan24"
+
+        depths_dir  = os.path.join(
+            data_dir,
+            "Depths",
+            f"{scan_name}_train"
+        )
+
+        #depths_dir = os.path.join(data_dir, f"Depths/{data_dir[:-1]}_train")
         image_dir = os.path.join(data_dir, "Rectified")
-        #mask_dir = os.path.join(data_dir, "mask")
         cam_dir = os.path.join(data_dir, "Cameras/train")
+        mask_dir = os.path.join(data_dir, "mask")
 
 
 
@@ -216,6 +231,7 @@ class Parser:
         rgbs = []
         normals3D = []
         points_per_image = dict()
+        normals_per_image = dict()
 
         N = 49
         for image_number in range(0, N):
@@ -223,12 +239,12 @@ class Parser:
             depth_name = f"{image_number:04d}"
             image_name = f"{(image_number+1):03d}"
             img_id = image_name
-            #mask_name = f"{(image_number):03d}"
+            mask_name = f"{(image_number):03d}"
             cam_name = f"{image_number:08}"
 
             depth_path = os.path.join(depths_dir, f"depth_map_{depth_name}.pfm")
             image_path = os.path.join(image_dir, f"rect_{image_name}_3_r5000.png")
-            #mask_path  = os.path.join(mask_dir, f"{mask_name}.png")
+            mask_path  = os.path.join(mask_dir, f"{mask_name}.png")
             cam_path = os.path.join(cam_dir, f"{cam_name}_cam.txt")
             
             image_names.append(image_name)
@@ -237,6 +253,11 @@ class Parser:
             image = imageio.imread(image_path)
             w2c, K, near_fars = read_cam(cam_path)
             c2w = np.linalg.inv(w2c)
+
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.resize(mask, None, fx=0.5, fy=0.5,
+                            interpolation=cv2.INTER_NEAREST)
+            mask = mask[44:556, 80:720]
 
             H, W = image.shape[0], image.shape[1]
             w2c_mats.append(w2c)
@@ -253,7 +274,7 @@ class Parser:
             imsize_dict[camera_id] = (W // factor, H // factor)
             mask_dict[camera_id] = None
 
-            points_world, rgb = unproject_depths(depth, image, w2c, K, near_fars)
+            points_world, rgb = unproject_depths(depth, image, mask, w2c, K, near_fars)
             points_per_image[img_id] = points_world
 
             points3D.append(points_world)
@@ -264,6 +285,8 @@ class Parser:
             pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30))
             pcd.orient_normals_towards_camera_location(c2w[:3, 3])
             normals_world = np.asarray(pcd.normals)
+            normals_per_image[img_id] = normals_world
+
             normals3D.append(normals_world)
 
 
@@ -359,6 +382,8 @@ class Parser:
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
         self.points_per_image = points_per_image  # Dict[str, np.ndarray], image_name -> [M, 3]
+        self.normals_per_image = normals_per_image
+        self.points_all = points3D
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.
@@ -477,15 +502,20 @@ class Dataset:
         index = self.indices[item]
         img_name_full = f"{self.parser.data_dir}/Rectified/rect_{self.parser.image_names[index]}_3_r5000.png"
 
-        image = imageio.imread(img_name_full)[..., :3]
-
-        image = (image * 255).astype(np.uint8)
-        
+        image = imageio.imread(img_name_full)[..., :3]        
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
-        mask = self.parser.mask_dict[camera_id]
+        mask_num = int(self.parser.image_names[index]) - 1
+        mask_name = f"{mask_num:03d}"
+        mask_name_full = f"{self.parser.data_dir}/mask/{mask_name}.png"
+
+        mask = cv2.imread(mask_name_full, cv2.IMREAD_GRAYSCALE)
+        mask = cv2.resize(mask, None, fx=0.5, fy=0.5,
+                        interpolation=cv2.INTER_NEAREST)
+        mask = mask[44:556, 80:720]
+
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -514,13 +544,16 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+            data["gt_alpha"] = torch.from_numpy(mask).float()
+
+        data["points_all"] = torch.from_numpy(self.parser.points_all).float()
 
         if self.load_depths:
             # projected points to image plane to get depths
             worldtocams = np.linalg.inv(camtoworlds)
             image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
-            points_world = self.parser.points[point_indices]
+            #point_indices = self.parser.point_indices[image_name]
+            points_world = self.parser.points_per_image[image_name]
             points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
             points_proj = (K @ points_cam.T).T
             points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
@@ -543,7 +576,9 @@ class Dataset:
         if self.sdf_loss:
             image_name = self.parser.image_names[index]
             points_world = self.parser.points_per_image[image_name]
+            normals_world = self.parser.normals_per_image[image_name]
             data["points_world"] = torch.from_numpy(points_world).float()
+            data["normals_world"] = torch.from_numpy(normals_world).float()
             
 
         return data
