@@ -59,7 +59,6 @@ from gsplat.cuda._torch_impl import (
 from gsplat.cuda._wrapper import(
     sphere_trace
 )
-from pytorch3d.transforms import matrix_to_quaternion
 torch.autograd.set_detect_anomaly(True)
 
 import mesh_extract
