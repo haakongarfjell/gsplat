@@ -61,7 +61,7 @@ from gsplat.cuda._wrapper import(
 )
 torch.autograd.set_detect_anomaly(True)
 
-import mesh_extract
+#import mesh_extract
 
 @dataclass
 class Config:
@@ -362,16 +362,6 @@ class Runner:
         self.device = f"cuda:{local_rank}"
 
         self.sdf_gaussians = set()
-
-        ptcloud_path = "/home/admin/haakon/gsplat/examples/data/monkey_depth/ptcloud.ply"
-        if not os.path.exists(ptcloud_path):
-            raise FileNotFoundError(f"Points file not found: {ptcloud_path}")
-        
-        ptcloud = o3d.io.read_point_cloud(ptcloud_path)
-        ptcloud = np.asarray(ptcloud.points)
-        
-        ptcloud = torch.tensor(ptcloud, device=self.device, dtype=torch.float32)
-        self.ptcloud = ptcloud
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
