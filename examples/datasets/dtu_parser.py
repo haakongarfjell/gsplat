@@ -146,7 +146,10 @@ def unproject_depths(depth, image, mask, w2c, K, near_fars):
     points_world = points_world[keep]
     colors       = colors[keep]
 
-    return points_world, colors
+    depth_vals   = depth_flat[keep]     # ← now an (M,) array, all >0
+    uv_coords    = np.stack([u_img_flat[keep], v_img_flat[keep]], axis=-1)
+
+    return points_world, colors, depth_vals, uv_coords
 
 def voxel_downsample_unique(points, rgbs, normals, num_bins=50):
 
@@ -232,6 +235,8 @@ class Parser:
         normals3D = []
         points_per_image = dict()
         normals_per_image = dict()
+        depths_per_image = dict()
+        uvs_per_image = dict()
 
         N = 49
         for image_number in range(0, N):
@@ -274,8 +279,10 @@ class Parser:
             imsize_dict[camera_id] = (W // factor, H // factor)
             mask_dict[camera_id] = None
 
-            points_world, rgb = unproject_depths(depth, image, mask, w2c, K, near_fars)
+            points_world, rgb, depth_vals, uv_coords = unproject_depths(depth, image, mask, w2c, K, near_fars)
             points_per_image[img_id] = points_world
+            depths_per_image[img_id] = depth_vals
+            uvs_per_image[img_id] = uv_coords
 
             points3D.append(points_world)
             rgbs.append(rgb)
@@ -384,6 +391,8 @@ class Parser:
         self.points_per_image = points_per_image  # Dict[str, np.ndarray], image_name -> [M, 3]
         self.normals_per_image = normals_per_image
         self.points_all = points3D
+        self.depths_per_image = depths_per_image
+        self.uvs_per_image = uvs_per_image
 
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.
@@ -549,29 +558,12 @@ class Dataset:
         data["points_all"] = torch.from_numpy(self.parser.points_all).float()
 
         if self.load_depths:
-            # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
+
             image_name = self.parser.image_names[index]
-            #point_indices = self.parser.point_indices[image_name]
-            points_world = self.parser.points_per_image[image_name]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
-            points_proj = (K @ points_cam.T).T
-            points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
-            depths = points_cam[:, 2]  # (M,)
-            # filter out points outside the image
-            selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
-            )
-            points = points[selector]
-            depths = depths[selector]
-            points_world = points_world[selector]
-            data["points"] = torch.from_numpy(points).float()
+            depths = self.parser.depths_per_image[image_name]    # (M,) all > 0
+            uvs = self.parser.uvs_per_image[image_name]       # (M,2)
+            data["points"] = torch.from_numpy(uvs).float()
             data["depths"] = torch.from_numpy(depths).float()
-            data["points_world"] = torch.from_numpy(points_world).float()
 
         if self.sdf_loss:
             image_name = self.parser.image_names[index]

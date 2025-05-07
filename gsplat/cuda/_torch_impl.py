@@ -1346,7 +1346,61 @@ def signed_distance(
     return dist_min, dist_indices
 
 
+
 def sphere_trace(
+    means: Tensor,
+    r_a: Tensor,
+    r_b: Tensor,
+    axes_a: Tensor,
+    axes_b: Tensor,
+    sdf_coeffs: Tensor,
+    sh_degree: int,
+    origins: Tensor,
+    directions: Tensor,
+    max_steps: int = 526,
+    min_hit_distance: float = 0.0001,
+    max_trace_distance: float = 10.0,
+):
+    H, W = origins.shape[:2]
+    num_rays = H*W
+
+    ro = origins.view(num_rays, 3)
+    rd = directions.view(num_rays, 3)
+
+    alive     = torch.ones(num_rays, dtype=torch.bool, device=ro.device)
+    t         = torch.zeros(num_rays,      device=ro.device)
+    hit_dist  = torch.full((num_rays,), max_trace_distance, device=ro.device)
+
+    for _ in range(max_steps):
+        if not alive.any():
+            break
+
+        idx_alive = alive.nonzero(as_tuple=False).squeeze(1)
+        pos       = ro[idx_alive] + t[idx_alive,None] * rd[idx_alive]
+        dist_alive, _ = signed_distance_knn(
+            pos, means, r_a, r_b, axes_a, axes_b, sdf_coeffs, sh_degree
+        )
+
+        hit_here = dist_alive < min_hit_distance
+
+        if hit_here.any():
+            hit_indices_global = idx_alive[hit_here]
+            hit_dist[hit_indices_global] = t[hit_indices_global]
+            alive[hit_indices_global] = False
+
+        t[idx_alive] = t[idx_alive] + dist_alive
+
+        too_far = t > max_trace_distance
+        if too_far.any():
+            hit_dist[too_far] = max_trace_distance
+            alive[too_far]    = False
+
+    return hit_dist.view(H, W)
+
+
+    
+
+def sphere_trace_old(
     means: Tensor,
     quats: Tensor,
     scales: Tensor,

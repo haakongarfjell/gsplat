@@ -13,7 +13,8 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
-from datasets.colmap import Dataset, Parser
+#from datasets.colmap import Dataset, Parser
+from datasets.dtu_parser import Dataset, Parser
 from datasets.traj import generate_interpolated_path
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -387,6 +388,7 @@ class Runner:
         Ks: Tensor,
         width: int,
         height: int,
+        mask: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -457,6 +459,7 @@ class Runner:
             render_distort = info["render_distloss"]
             render_median = render_colors[..., 3]
 
+
         return (
             render_colors,
             render_alphas,
@@ -504,6 +507,7 @@ class Runner:
 
         # Training loop.
         global_tic = time.time()
+        self.id_to_count = {}
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             if not cfg.disable_viewer:
@@ -525,6 +529,9 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
+            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            gt_alpha = data["gt_alpha"].to(device) if "gt_alpha" in data else None  # [1, H, W]
+            
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -588,6 +595,10 @@ class Runner:
                 pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+            if gt_alpha is not None:
+                alpha_loss = F.l1_loss(alphas, gt_alpha.unsqueeze(-1))
+                loss += alpha_loss
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -669,6 +680,10 @@ class Runner:
                 self.writer.flush()
 
             self.strategy.step_post_backward(
+                points_all=None,
+                id_to_count=self.id_to_count,
+                gaussian_ids_all = None,
+                sdf_pruning=False,
                 params=self.splats,
                 optimizers=self.optimizers,
                 state=self.strategy_state,
@@ -839,6 +854,10 @@ class Runner:
             imageio.imwrite(
                 f"{self.render_dir}/val_{i:04d}_distortions_{step}.png", render_dist
             )
+            masks = data["mask"].to(device) if "mask" in data else None
+            if masks is not None:
+                pixels = pixels * masks[..., None]
+                colors = colors * masks[..., None]
 
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
             colors = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
