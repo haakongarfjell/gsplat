@@ -32,13 +32,14 @@ if __name__ == '__main__':
     parser.add_argument('--scan', type=int, default=24)
     parser.add_argument('--mode', type=str, default='mesh', choices=['mesh', 'pcd'])
     parser.add_argument('--dataset_dir', type=str, default='data/DTU')
-    parser.add_argument('--vis_out_dir', type=str, default='results/dtu_test_sdf_refine_04/vis')
+    parser.add_argument('--vis_out_dir', type=str, default='results/dtu_test_sdf_refine_04/vis_29999')
     parser.add_argument('--downsample_density', type=float, default=0.2)
     parser.add_argument('--patch_size', type=float, default=60)
     parser.add_argument('--max_dist', type=float, default=20)
     parser.add_argument('--visualize_threshold', type=float, default=10)
     args = parser.parse_args()
 
+    os.makedirs(args.vis_out_dir, exist_ok=True)
     thresh = args.downsample_density
     if args.mode == 'mesh':
         pbar = tqdm(total=9)

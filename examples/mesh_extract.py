@@ -10,10 +10,9 @@ from typing import Dict, Any
 import open3d as o3d
 import open3d.core as o3c
 import trimesh
-from skimage.measure import marching_cubes
-from chamfer_distance import ChamferDistance
 import multiprocessing as mp
 from sklearn.neighbors import NearestNeighbors
+from skimage.measure import marching_cubes
 from matplotlib import cm
 from typing import Tuple
 
