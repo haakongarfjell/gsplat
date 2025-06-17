@@ -1031,31 +1031,31 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if not (6499 < step < 7000 or 29499 < step < 30000) and cfg.sdf_loss:
-                if isinstance(self.cfg.strategy, DefaultStrategy):
-                    self.cfg.strategy.step_post_backward(
-                        points_all,
-                        self.id_to_count,
-                        self.gaussian_ids_all,
-                        cfg.sdf_pruning,
-                        params=self.splats,
-                        optimizers=self.optimizers,
-                        state=self.strategy_state,
-                        step=step,
-                        info=info,
-                        packed=cfg.packed,
-                    )
-                elif isinstance(self.cfg.strategy, MCMCStrategy):
-                    self.cfg.strategy.step_post_backward(
-                        params=self.splats,
-                        optimizers=self.optimizers,
-                        state=self.strategy_state,
-                        step=step,
-                        info=info,
-                        lr=schedulers[0].get_last_lr()[0],
-                    )
-                else:
-                    assert_never(self.cfg.strategy)
+            #if not (6499 < step < 7000 or 29499 < step < 30000) and cfg.sdf_loss:
+            if isinstance(self.cfg.strategy, DefaultStrategy):
+                self.cfg.strategy.step_post_backward(
+                    self.id_to_count,
+                    self.gaussian_ids_all,
+                    cfg.sdf_pruning,
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                )
+            elif isinstance(self.cfg.strategy, MCMCStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    lr=schedulers[0].get_last_lr()[0],
+                )
+            else:
+                assert_never(self.cfg.strategy)
+
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:

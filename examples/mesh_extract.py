@@ -145,7 +145,8 @@ class MeshExtract:
             self.sdf_coeffs = torch.zeros((self.means.shape[0], 2**(self.sh_degree+1)), device=self.device)
             
         print(f"Loaded {self.means.shape[0]} splats")
-    
+            
+
     def load_cameras_blender(self):
         cam_path = os.path.join(self.data_dir, "cameras.txt")
         if not os.path.exists(cam_path):
@@ -381,7 +382,6 @@ class MeshExtract:
             batch_size = 100000
     ):
 
-
         means = self.means[self.gaussian_ids]
         quats = self.quats[self.gaussian_ids]
         scales = self.scales[self.gaussian_ids]
@@ -481,36 +481,169 @@ class MeshExtract:
         height: float = 2.0,               
         n: int = 500,                     
         batch_size: int = 100_000,
-        colormap: str = "hot"
+        colormap: str = "turbo"
     ):
         origin_t = torch.tensor(origin, device=self.device, dtype=torch.float32)
         normal_t = torch.tensor(normal, device=self.device, dtype=torch.float32)
         normal_t = normal_t / normal_t.norm()
 
-        # 2) pick a helper axis
         z_axis = origin_t.new_tensor([0.0, 0.0, 1.0])
         if torch.allclose(normal_t.abs(), z_axis):
             helper = origin_t.new_tensor([0.0, 1.0, 0.0])
         else:
             helper = z_axis
 
-        # 3) build your in-plane axes u, v
         u = torch.cross(normal_t, helper)
         u = u / u.norm()
         v = torch.cross(normal_t, u)
 
-        # 4) now you can safely use `n` as an int
         us = torch.linspace(-width/2, width/2, n,  device=self.device)
         vs = torch.linspace(-height/2, height/2, n, device=self.device)
         U, V = torch.meshgrid(us, vs, indexing="ij")
 
         pts = origin_t[None] + U.reshape(-1,1)*u[None] + V.reshape(-1,1)*v[None]
         sdf_vals = []
-        means      = self.means[self.gaussian_ids]
+
+    
+
+        means = self.means[self.gaussian_ids]
+        quats = self.quats[self.gaussian_ids]
+        scales = self.scales[self.gaussian_ids]
+        opacities = self.opacities[self.gaussian_ids]
+        sdf_coeffs = self.sdf_coeffs[self.gaussian_ids]
+
+        opacity_threshold = 0.1
+        mask = opacities > opacity_threshold
+        means = means[mask]
+        quats = quats[mask]
+        scales = scales[mask]
+        opacities = opacities[mask]
+        sdf_coeffs = sdf_coeffs[mask]
+
+
+        print(f"Using {means.shape[0]} Gaussians for sdf computations")
         r_a, r_b, axes_a, axes_b, _ = gaussian_to_ellipse(
-            means, self.quats[self.gaussian_ids],
-            self.scales[self.gaussian_ids],
-            self.opacities[self.gaussian_ids]
+            means, quats,
+            scales, opacities
+        )
+        for i in range(0, pts.shape[0], batch_size):
+            sdf_b, _ = signed_distance_knn(
+                pos=pts[i:i+batch_size],
+                means=means, r_a=r_a, r_b=r_b,
+                axes_a=axes_a, axes_b=axes_b,
+                sdf_coeffs=self.sdf_coeffs[self.gaussian_ids],
+                sh_degree=self.sh_degree,
+                k=500
+            )
+            sdf_vals.append(sdf_b)
+        sdf = torch.cat(sdf_vals, dim=0).cpu().numpy()
+
+        vmin, vmax = float(sdf.min()), float(sdf.max())
+        normed     = (sdf - vmin) / (vmax - vmin + 1e-12)
+        cmap       = cm.get_cmap(colormap)
+        colors     = cmap(normed)[:,:3].astype(np.float32)
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts.cpu().numpy())
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        out = os.path.join(self.result_dir, f"sdf_plane_{self.step}.ply")
+        o3d.io.write_point_cloud(out, pcd)
+        print(f"Wrote plane SDF to {out}")
+
+    def extract_sdf_plane_all(
+        self,
+        origin: Tuple[float,float,float],    
+        normal: Tuple[float,float,float],    
+        width: float = 2.0,                 
+        height: float = 2.0,               
+        n: int = 500,                     
+        batch_size: int = 100_000,
+        colormap: str = "turbo"
+    ):
+        origin_t = torch.tensor(origin, device=self.device, dtype=torch.float32)
+        normal_t = torch.tensor(normal, device=self.device, dtype=torch.float32)
+        normal_t = normal_t / normal_t.norm()
+
+        z_axis = origin_t.new_tensor([0.0, 0.0, 1.0])
+        if torch.allclose(normal_t.abs(), z_axis):
+            helper = origin_t.new_tensor([0.0, 1.0, 0.0])
+        else:
+            helper = z_axis
+
+        u = torch.cross(normal_t, helper)
+        u = u / u.norm()
+        v = torch.cross(normal_t, u)
+
+        us = torch.linspace(-width/2, width/2, n,  device=self.device)
+        vs = torch.linspace(-height/2, height/2, n, device=self.device)
+        U, V = torch.meshgrid(us, vs, indexing="ij")
+
+        pts = origin_t[None] + U.reshape(-1,1)*u[None] + V.reshape(-1,1)*v[None]
+        sdf_vals = []
+        import open3d as o3d
+        scan_ids = [40, 55, 106, 24, 110]
+        results_dirs = [f"results/dtu_sdf_scan{scan_ids[0]}",
+                        f"results/dtu_sdf_scan{scan_ids[1]}", 
+                        f"results/dtu_sdf_scan{scan_ids[2]}", 
+                        f"results/dtu_sdf_scan{scan_ids[3]}", 
+                        f"results/dtu_sdf_scan{scan_ids[4]}"]
+        mesh_dirs = [f"results/dtu_sdf_scan{scan_ids[0]}/marching_cubes_29999.ply", 
+                     f"results/dtu_sdf_scan{scan_ids[1]}/marching_cubes_29999.ply", 
+                     f"results/dtu_sdf_scan{scan_ids[2]}/marching_cubes_29999.ply",
+                     f"results/dtu_sdf_scan{scan_ids[3]}/marching_cubes_29999.ply",
+                     f"results/dtu_sdf_scan{scan_ids[4]}/marching_cubes_29999.ply"]
+
+        means_all, quats_all, scales_all, opacities_all, sdf_coeffs_all = [], [], [], [], []
+        shift = [5, 2.5, 0, -2.5, -5.0]
+
+        for i in range(5):
+            self.result_dir = results_dirs[i]
+
+            self.load_splat()
+            self.load_gaussian_ids()
+
+            means = self.means[self.gaussian_ids]
+            quats = self.quats[self.gaussian_ids]
+            scales = self.scales[self.gaussian_ids]
+            opacities = self.opacities[self.gaussian_ids]
+            sdf_coeffs = self.sdf_coeffs[self.gaussian_ids]
+
+            opacity_threshold = 0.1
+            mask = opacities > opacity_threshold
+            means = means[mask]
+            d = shift[i]
+            means = means + v.unsqueeze(0) * d
+            quats = quats[mask]
+            scales = scales[mask]
+            opacities = opacities[mask]
+            sdf_coeffs = sdf_coeffs[mask]
+
+            means_all.append(means)
+            quats_all.append(quats)
+            scales_all.append(scales)
+            opacities_all.append(opacities)
+            sdf_coeffs_all.append(sdf_coeffs)
+
+            mesh = o3d.io.read_triangle_mesh(mesh_dirs[i])
+            translation = (d * v.cpu().numpy()).tolist()
+            mesh.translate(translation, relative=True)
+            out_name = f"mcubes{scan_ids[i]}_{self.step}.ply"
+            out_path = os.path.join("/home/admin/haakon/gsplat/examples/results/mesh_images", out_name)
+            o3d.io.write_triangle_mesh(out_path, mesh)
+            print(f"Wrote shifted mesh: {out_path}")
+            
+        means = torch.cat(means_all, dim=0)
+        quats = torch.cat(quats_all, dim=0)
+        scales = torch.cat(scales_all, dim=0)
+        opacities = torch.cat(opacities_all, dim=0)
+        sdf_coeffs = torch.cat(sdf_coeffs_all, dim=0)
+
+        print(means.shape, quats.shape, scales.shape, opacities.shape, sdf_coeffs.shape)
+        
+        print(f"Using {means.shape[0]} Gaussians for sdf computations")
+        r_a, r_b, axes_a, axes_b, _ = gaussian_to_ellipse(
+            means, quats,
+            scales, opacities
         )
         for i in range(0, pts.shape[0], batch_size):
             sdf_b, _ = signed_distance_knn(
@@ -531,10 +664,9 @@ class MeshExtract:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts.cpu().numpy())
         pcd.colors = o3d.utility.Vector3dVector(colors)
-        out = os.path.join(self.result_dir, f"sdf_plane_{self.step}.ply")
+        out = os.path.join("/home/admin/haakon/gsplat/examples/results/mesh_images", f"sdf_plane_{self.step}.ply")
         o3d.io.write_point_cloud(out, pcd)
         print(f"Wrote plane SDF to {out}")
-
 
     
     def sample_mesh(self, mesh: trimesh.Trimesh, density: float) -> np.ndarray:
@@ -643,8 +775,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="data/DTU/scan24")
-    parser.add_argument("--result_dir", type=str, default="results/dtu_sdf_scan24")
+    parser.add_argument("--data_dir", type=str, default="data/DTU/scan105")
+    parser.add_argument("--result_dir", type=str, default="results/dtu_sdf_scan105")
     parser.add_argument("--ckpt", type=str, default="ckpts/ckpt_29999_rank0.pt")
     parser.add_argument("--gt_mesh_dir", type=str, default="data/DTU/scan24/depth_dtu_scan24_full.ply")
     parser.add_argument("--sdf_loss", type=bool, default=True)
@@ -671,12 +803,36 @@ if __name__ == "__main__":
     )
 
     #mesh_extract.extract_rasterization()
-    mesh_extract.extract_marching_cubes()
+    # mesh_extract.extract_marching_cubes()
     #mesh_extract.compute_chamfer_distance()
-#     mesh_extract.extract_sdf_plane(
-#         origin=(0, 0, 3.5),
-#         normal=(0.009955, -0.3814, -0.91903),
-#         width=5.0,
-#         height=5.0,
-#         n=1000
-# )
+    mesh_extract.extract_sdf_plane(
+        origin=(0, 0, 3.5),
+        normal=(0.009955, -0.3814, -0.91903),
+        width=2.0,
+        height=2.0,
+        n=1000
+)
+    
+
+    # import numpy as np
+    # from scipy.spatial.transform import Rotation as R
+
+    # # original
+    # normal = np.array([0.009955, -0.3814, -0.91903])
+
+    # # +90° about X
+    # rot_x = R.from_euler('x', 75, degrees=True)
+    # n1 = rot_x.apply(normal)
+
+    # # +30° about Y
+    # rot_y = R.from_euler('y', -60, degrees=True)
+    # n2 = rot_y.apply(n1)
+
+    # print("Final normal:", n2)
+    # mesh_extract.extract_sdf_plane(
+    #     origin=(0.0, 0.0, 3.5),
+    #     normal=tuple(n2),
+    #     width=0.5,
+    #     height=2.0,
+    #     n=1000
+    # )

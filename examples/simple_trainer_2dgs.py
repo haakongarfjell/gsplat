@@ -168,6 +168,8 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
+    normalize: bool = False
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -274,7 +276,7 @@ class Runner:
         self.parser = Parser(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
-            normalize=True,
+            normalize=cfg.normalize,
             test_every=cfg.test_every,
         )
         self.trainset = Dataset(

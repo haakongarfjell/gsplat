@@ -153,7 +153,7 @@ class DefaultStrategy(Strategy):
 
     def step_post_backward(
         self,
-        points_all,
+        #points_all,
         id_to_count,
         gaussian_ids_all,
         sdf_pruning,
@@ -177,7 +177,7 @@ class DefaultStrategy(Strategy):
         ):
             # prune GSs
             n_prune = self._prune_gs(
-                points_all,
+                #points_all,
                 id_to_count,
                 gaussian_ids_all,
                 sdf_pruning,
@@ -335,7 +335,7 @@ class DefaultStrategy(Strategy):
     @torch.no_grad()
     def _prune_gs(
         self,
-        points_all,
+        #points_all,
         id_to_count,
         gaussian_ids_all,
         sdf_pruning,
@@ -361,14 +361,14 @@ class DefaultStrategy(Strategy):
 
             is_prune = is_prune | is_too_big
 
-        if sdf_pruning:
-            means = params["means"]
+        # if sdf_pruning:
+        #     means = params["means"]
 
-            dists, idx = knn_candidates(points_all.squeeze(0), means, k=1)
+        #     dists, idx = knn_candidates(points_all.squeeze(0), means, k=1)
             
-            far_mask = dists > 0.1
+        #     far_mask = dists > 0.1
 
-            is_prune[far_mask] = True
+        #     is_prune[far_mask] = True
 
 
 

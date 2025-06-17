@@ -17,7 +17,7 @@ from gsplat.cuda._torch_impl import (
     sphere_trace,
 )
 
-from gsplat.rendering import rasterization_2dgs
+from gsplat.rendering import rasterization_2dgs, rasterization
 
 import torch.nn.functional as F
 import re
@@ -35,6 +35,7 @@ class SDFDepthRender:
         step: int,
         sdf_loss: bool = False,
         load_depths: bool = False,
+        gs3: bool = False,
         device: str = "cuda",
     ):
         self.data_dir = data_dir
@@ -44,6 +45,7 @@ class SDFDepthRender:
         self.step = step
         self.sdf_loss = sdf_loss
         self.load_depths = load_depths
+        self.gs3 = gs3
         self.device = device
 
         self.parser = Parser(
@@ -246,11 +248,13 @@ class SDFDepthRender:
             self.renderset, batch_size=1, shuffle=False, num_workers=1
         )
 
-        video_path = os.path.join(self.result_dir, "depth.mp4")
+        video_path = os.path.join(self.result_dir, "depth_rasterize.mp4")
         writer = imageio.get_writer(video_path, fps=30)
 
         depthloss_total = 0.0
         for i, data in enumerate(renderloader):
+            if i != 8:
+                continue
             print(f"Processing {i+1}/{len(renderloader)}")
             camtoworlds = data["camtoworld"].to(self.device)
             Ks = data["K"].to(self.device)
@@ -293,6 +297,24 @@ class SDFDepthRender:
 
                 threshold = total_distance >= 9.5
                 depth_pred[threshold] = 0.0
+            elif self.gs3:
+                renders, render_alphas, info = rasterization(
+                    means=self.means,
+                    quats=self.quats,
+                    scales=self.scales,
+                    opacities=self.opacities,
+                    colors=self.colors,
+                    viewmats=np.linalg.inv(c2w),             # [1, 4, 4]
+                    Ks=Ks,         # [1, 3, 3]
+                    width=self.width,
+                    height=self.height,
+                    sh_degree=self.sh_degree,
+                    render_mode="RGB+ED",          
+                    distributed=False,
+                )
+                render_colors = renders[..., :3]  # [1, H, W, 3]
+                render_depths = renders[..., 3:4]  # [1, H, W, 1]
+                depth_pred = render_depths.squeeze(0).squeeze(-1)  # [H, W]
             # render depth here
             else:
                 (
@@ -394,7 +416,7 @@ class SDFDepthRender:
         writer.close()
         print(f"Saved depth video to {video_path}")
         print(f"Average depth loss: {depthloss_total / len(renderloader)}")
-        with open(os.path.join(self.result_dir, "depth_loss.json"), "w") as f:
+        with open(os.path.join(self.result_dir, "depth_loss_rasterize.json"), "w") as f:
             f.write(f'{{"average_depth_loss": {depthloss_total / len(renderloader)}}}\n')
 
 
@@ -409,6 +431,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default="ckpts/ckpt_29999_rank0.pt")
     parser.add_argument("--step", type=int, default=29999)
     parser.add_argument("--sdf_loss", type=bool, default=False)
+    parser.add_argument("--gs3", type=bool, default=False)
     parser.add_argument("--load_depths", type=bool, default=False)
     parser.add_argument("--device", type=str, default="cuda")
 

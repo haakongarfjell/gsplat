@@ -968,10 +968,11 @@ def signed_distance_knn(
     axes_b: torch.Tensor, # [N, 3],
     sdf_coeffs: torch.Tensor, # [N, K]
     sh_degree: int,
+    k: int = 10,
     eps = 1e-8
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     
-    _, indices = knn_candidates(means, pos, k=10)  # [M, k]
+    _, indices = knn_candidates(means, pos, k=k)  # [M, k]
     means_knn   = means[indices]      # [M, k, 3]
     r_a_knn     = r_a[indices]        # [M, k]
     r_b_knn     = r_b[indices]        # [M, k]
