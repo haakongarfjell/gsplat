@@ -1,0 +1,16 @@
+#No cons
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan24/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons24 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan37/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons37 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan40/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons40 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan55/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons55 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan63/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons63 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan65/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons65 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan69/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons69 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan83/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons83 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan97/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons97 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan105/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons105 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan106/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons106 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan110/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons110 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan114/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons114 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan118/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons118 --sdf_loss --disable_viewer --eikonal_lambda 0.0
+python simple_trainer.py default --data_dir /mnt/data/DTU/scan122/ --data_factor 1 --result_dir /mnt/results/dtu_no_cons122 --sdf_loss --disable_viewer --eikonal_lambda 0.0

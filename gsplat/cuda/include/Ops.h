@@ -563,4 +563,21 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     const at::Tensor v_render_alphas  // [..., C, image_height, image_width, 1]
 );
 
+// Sphere tracing for SDF-based depth rendering
+std::tuple<at::Tensor, at::Tensor> sphere_trace(
+    const at::Tensor &means,      // [N, 3]
+    const at::Tensor &quats,      // [N, 4]
+    const at::Tensor &scales,     // [N, 3]
+    const at::Tensor &colors,     // [N, 3]
+    const at::Tensor &origins,    // [H, W, 3]
+    const at::Tensor &directions, // [H, W, 3]
+    const at::Tensor &r_a,        // [N]
+    const at::Tensor &r_b,        // [N]
+    const at::Tensor &axes_a,     // [N, 3]
+    const at::Tensor &axes_b,     // [N, 3]
+    const int max_steps,
+    const float min_hit_distance,
+    const float max_trace_distance
+);
+
 } // namespace gsplat

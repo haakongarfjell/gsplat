@@ -18,6 +18,7 @@ from .cuda._wrapper import (
     rasterize_to_pixels,
     rasterize_to_pixels_2dgs,
     rasterize_to_pixels_eval3d,
+    sphere_trace,
     spherical_harmonics,
     world_to_cam,
 )
@@ -60,6 +61,7 @@ all = [
     "RollingShutterType",
     "fully_fused_projection_with_ut",
     "rasterize_to_pixels_eval3d",
+    "sphere_trace",
     "export_splats",
     "__version__",
 ]

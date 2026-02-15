@@ -39,6 +39,19 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+from gsplat.cuda._torch_impl import (
+    generate_rays,
+    gaussian_to_ellipse,
+    signed_distance_knn,
+    hessian_loss,
+    filter_scales,
+    update_id_to_count,
+    outer_ellipsoid,
+    surface_consistency_loss,
+    normals_to_quats,
+    unproject_depths,
+)
+from gsplat.cuda._wrapper import sphere_trace
 
 
 @dataclass
@@ -188,6 +201,21 @@ class Config:
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
+    # Enable SDF loss for surface supervision
+    sdf_loss: bool = False
+    # Enable SDF-based pruning
+    sdf_pruning: bool = False
+    # Weight for SDF loss
+    sdf_lambda: float = 1.0
+    # Weight for Hessian regularization
+    hessian_lambda: float = 1e-8
+    # Alpha threshold for filtering Gaussians in SDF computation
+    alpha_threshold: float = 0.0
+    # Learning rate scale for SDF parameters (sdf0, sdfN)
+    sdf_lr_scale: float = 0.1
+    # Weight for eikonal loss
+    eikonal_lambda: float = 1e-2 * 2
+
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Save training images to tensorboard
@@ -246,6 +274,8 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    sdf_loss: bool = False,
+    sdf_lr_scale: float = 0.1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -259,7 +289,14 @@ def create_splats_with_optimizers(
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+
+    if sdf_loss and hasattr(parser, "normals") and parser.normals is not None:
+        normals = torch.from_numpy(parser.normals).float()
+        tangent_scale = torch.log(dist_avg * init_scale)  # [N,]
+        normal_scale = tangent_scale * 1e-3  # [N,]
+        scales = torch.stack([tangent_scale, tangent_scale, normal_scale], dim=1)
+    else:
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
@@ -267,7 +304,11 @@ def create_splats_with_optimizers(
     scales = scales[world_rank::world_size]
 
     N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
+    if sdf_loss and hasattr(parser, "normals") and parser.normals is not None:
+        normals = normals[world_rank::world_size]
+        quats = normals_to_quats(normals)  # [N, 4]
+    else:
+        quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
     params = [
@@ -284,6 +325,11 @@ def create_splats_with_optimizers(
         colors[:, 0, :] = rgb_to_sh(rgbs)
         params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+
+        if sdf_loss:
+            sdf_coeffs = torch.zeros((N, (sh_degree + 1) ** 2))  # [N, K]
+            params.append(("sdf0", torch.nn.Parameter(sdf_coeffs[:, :1]), sh0_lr))
+            params.append(("sdfN", torch.nn.Parameter(sdf_coeffs[:, 1:]), shN_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -306,7 +352,7 @@ def create_splats_with_optimizers(
         optimizer_class = torch.optim.Adam
     optimizers = {
         name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+            [{"params": splats[name], "lr": lr * math.sqrt(BS) * (sdf_lr_scale if name.startswith("sdf") else 1.0), "name": name}],
             eps=1e-15 / math.sqrt(BS),
             # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
@@ -355,11 +401,16 @@ class Runner:
             test_every=cfg.test_every,
             load_exposure=cfg.load_exposure,
         )
+        trainset_kwargs = dict(
+            patch_size=cfg.patch_size,
+            load_depths=cfg.depth_loss,
+        )
+        if cfg.sdf_loss:
+            trainset_kwargs["sdf_loss"] = True
         self.trainset = Dataset(
             self.parser,
             split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
+            **trainset_kwargs,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -408,8 +459,15 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            sdf_loss=cfg.sdf_loss,
+            sdf_lr_scale=cfg.sdf_lr_scale,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        # SDF state tracking
+        self.sdf_gaussians = set()
+        self.id_to_count = {}
+        self.gaussian_ids_all = set(range(self.splats["means"].shape[0]))
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -723,6 +781,8 @@ class Runner:
         trainloader_iter = iter(trainloader)
 
         # Training loop.
+        self.id_to_count = {}
+        self.gaussian_ids_all = set(range(self.splats["means"].shape[0]))
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
@@ -762,6 +822,12 @@ class Runner:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
+            if cfg.sdf_loss:
+                points_world = data["points_world"].to(device).squeeze(0)  # [M, 3]
+                normals_world = data["normals_world"].to(device).squeeze(0)  # [M, 3]
+                points_sample = points_world.clone().detach().requires_grad_(True)
+                normals_sample = normals_world.clone().detach().requires_grad_(True)
+
             height, width = pixels.shape[1:3]
 
             if cfg.pose_noise:
@@ -783,7 +849,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode="RGB+ED" if (cfg.depth_loss or cfg.sdf_loss) else "RGB",
                 masks=masks,
                 frame_idcs=image_ids,
                 camera_idcs=data["camera_idx"].to(device),
@@ -831,6 +897,42 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+            if cfg.sdf_loss:
+                means = self.splats["means"]
+                quats = self.splats["quats"]
+                scales = torch.exp(self.splats["scales"])
+                opacities = torch.sigmoid(self.splats["opacities"])
+                sdf_coeffs = torch.cat([self.splats["sdf0"], self.splats["sdfN"]], 1)
+
+                r_a, r_b, axes_a, axes_b, normals = gaussian_to_ellipse(
+                    means, quats, scales, opacities
+                )
+
+                def sdf_fn(pos_sample: torch.Tensor) -> torch.Tensor:
+                    sdf_values, idx = signed_distance_knn(
+                        pos=pos_sample,
+                        means=means,
+                        r_a=r_a,
+                        r_b=r_b,
+                        axes_a=axes_a,
+                        axes_b=axes_b,
+                        sdf_coeffs=sdf_coeffs,
+                        sh_degree=sh_degree_to_use,
+                    )
+                    return sdf_values, idx
+
+                sdfloss, L_d, L_v, L_hess, sdf_vals, idx = surface_consistency_loss(
+                    pos=points_sample,
+                    means=means,
+                    global_normals=normals_sample,
+                    sdf_fn=sdf_fn,
+                )
+
+                loss += sdfloss * cfg.sdf_lambda + L_d * cfg.eikonal_lambda + L_v * cfg.eikonal_lambda
+
+                gaussian_ids_all = set(range(self.splats["means"].shape[0]))
+                self.id_to_count = update_id_to_count(self.id_to_count, gaussian_ids_all, idx)
+
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids
@@ -853,6 +955,10 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if cfg.sdf_loss:
+                desc += f"L_sdf={sdfloss.item():.6f}| "
+                desc += f"L_d={L_d.item():.6f}| "
+                desc += f"L_v={L_v.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -877,6 +983,10 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if cfg.sdf_loss:
+                    self.writer.add_scalar("train/sdfloss", sdfloss.item(), step)
+                    self.writer.add_scalar("train/L_d", L_d.item(), step)
+                    self.writer.add_scalar("train/L_v", L_v.item(), step)
                 if cfg.post_processing is not None:
                     self.writer.add_scalar(
                         "train/post_processing_reg_loss",
@@ -1001,6 +1111,9 @@ class Runner:
             # Run post-backward steps after backward and optimizer
             if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
+                    self.id_to_count,
+                    self.gaussian_ids_all,
+                    cfg.sdf_pruning,
                     params=self.splats,
                     optimizers=self.optimizers,
                     state=self.strategy_state,

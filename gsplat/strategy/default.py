@@ -6,6 +6,7 @@ from typing_extensions import Literal
 
 from .base import Strategy
 from .ops import duplicate, remove, reset_opa, split
+from gsplat.cuda._torch_impl import knn_candidates
 
 
 @dataclass
@@ -151,6 +152,9 @@ class DefaultStrategy(Strategy):
 
     def step_post_backward(
         self,
+        id_to_count,
+        gaussian_ids_all,
+        sdf_pruning,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
@@ -169,19 +173,28 @@ class DefaultStrategy(Strategy):
             and step % self.refine_every == 0
             and step % self.reset_every >= self.pause_refine_after_reset
         ):
+            # prune GSs
+            n_prune = self._prune_gs(
+                id_to_count,
+                gaussian_ids_all,
+                sdf_pruning,
+                params,
+                optimizers,
+                state,
+                step,
+            )
+            id_to_count.clear()
+            if self.verbose:
+                print(
+                    f"Step {step}: {n_prune} GSs pruned. "
+                    f"Now having {len(params['means'])} GSs."
+                )
+
             # grow GSs
             n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
             if self.verbose:
                 print(
                     f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
-                    f"Now having {len(params['means'])} GSs."
-                )
-
-            # prune GSs
-            n_prune = self._prune_gs(params, optimizers, state, step)
-            if self.verbose:
-                print(
-                    f"Step {step}: {n_prune} GSs pruned. "
                     f"Now having {len(params['means'])} GSs."
                 )
 
@@ -311,6 +324,9 @@ class DefaultStrategy(Strategy):
     @torch.no_grad()
     def _prune_gs(
         self,
+        id_to_count,
+        gaussian_ids_all,
+        sdf_pruning,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
